@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fail-early ABI checks for Kimi K3's private GPU dependencies."""
 
 from __future__ import annotations
@@ -14,6 +15,10 @@ from pathlib import Path
 from typing import Any
 
 _CUTLASS_DSL_VERSION = "4.8.0"
+# Rows the trtllm-gen multi-CTA KV counter (one u32 semaphore per (row, head), self-resetting) is sized for at every MLA
+# workspace: the largest verify batch any MK object may serve (Breq 16 x 8 query rows = 128).
+# FlashInfer refuses a call whose rows x heads exceed the buffer ("got 1536 bytes, need 3072" at 128 rows with 64).
+TRTLLM_KV_COUNTER_ROWS = 128
 _FLASHINFER_DISTRIBUTIONS = (
     "flashinfer-python",
     "flashinfer-cubin",
@@ -159,7 +164,12 @@ def validate_runtime_compatibility() -> str:
         Path(path).resolve() for path in (module_spec.extra_include_dirs or ())
     )
     _require_files(sources, "FlashInfer TRTLLM-gen wrapper sources")
-    _require_files(artifacts, "FlashInfer TRTLLM-gen AOT artifacts")
+    # FlashInfer's jit-cache wheel may not ship the fmha_gen AOT module for this device
+    # (the cu134 image on SM107 lists none): FlashInfer then JIT-compiles it from the
+    # sources above at first use, which the MLA providers' warm call makes happen before
+    # graph capture. Only listed artifacts must exist.
+    if artifacts:
+        _require_files(artifacts, "FlashInfer TRTLLM-gen AOT artifacts")
     _require_files(
         includes,
         "FlashInfer TRTLLM-gen include directories",
@@ -176,6 +186,7 @@ def validate_runtime_compatibility() -> str:
         "trtllm_mla_parameters": sorted(_TRTLLM_MLA_PARAMETERS),
         "trtllm_gen_sources": [str(path) for path in sources],
         "trtllm_gen_artifacts": [str(path) for path in artifacts],
+        "trtllm_gen_mode": "aot" if artifacts else "jit",
         "trtllm_gen_aot_path": str(Path(module_spec.aot_path).resolve()),
         "trtllm_gen_includes": [str(path) for path in includes],
         "trtllm_gen_name": str(module_spec.name),

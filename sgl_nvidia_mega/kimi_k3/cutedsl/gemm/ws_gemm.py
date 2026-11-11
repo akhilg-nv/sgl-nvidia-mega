@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Options described as "ported" follow NVIDIA's Rubin (sm_107) specialized-decode kernels (the rubin package).
 """Weight-stationary skinny GEMM for the MoE front: y[M, N] = x[M, K] @ W[N, K]^T.
 
 Each CTA owns ``rt`` 16-row N tiles; its ``rt * kq`` warps split K into ``kq`` ranges.
@@ -22,6 +24,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Int64, Uint32, Uint64
 
+from ..common.mailbox import K23_ARM
 from ..common.primitives import (
     alloc,
     asm,
@@ -29,6 +32,7 @@ from ..common.primitives import (
     bf16x2,
     bits_float,
     copy_g2s,
+    fence_proxy_async_global,
     float_bits,
     launch,
     load_words,
@@ -38,6 +42,16 @@ from ..common.primitives import (
     smem_words,
     wait,
 )
+
+
+@asm()
+def coherent_weight_words(pointer):
+    """Four 32-bit words of a static weight row by a coherent ``ld.global`` (L1 no-allocate,
+    L2 evict-first): ptxas keeps it above ``griddepcontrol.wait``, while it may sink the
+    ``ld.global.nc`` form below the wait."""
+    policy = ".reg .b64 pol; createpolicy.fractional.L2::evict_first.b64 pol, 1.0; "
+    code = "{ " + policy + "ld.global.L1::no_allocate.L2::cache_hint.v4.b32 {$0,$1,$2,$3}, [$4], pol; }"
+    return code, "=r,=r,=r,=r,l", (pointer,), (Uint32,) * 4, True
 
 
 @asm(Uint32, pure=True)
@@ -64,6 +78,20 @@ def positive_zero32(value):
 
 
 class WsGemm:
+    # Register weight loads (``K31MK_FRONT_EARLY_WEIGHTS``; 0 = shipped): bit 1
+    # issues them at kernel entry (the ported EARLY_WEIGHTS placement), bit 2 uses coherent
+    # loads. Either keeps them above griddepcontrol.wait in SASS (the shipped ``.nc`` loads are
+    # sunk below it). Weights are static (written before any kernel of the step), so loading
+    # them before the wait reads no predecessor output. Set per instance before compiling.
+    early_weights = 0
+    # K-16 consumer-side proxy fence (``K31MK_FRONT_TMA_FENCE``; 0 = served): the
+    # warp that bulk-copies x (written generically by the PDL predecessor OprojFused) runs
+    # fence.proxy.async.global after griddepcontrol.wait, before its first copy. Set per instance.
+    tma_fence = 0
+    # K-19 trigger fence (``K31MK_K19_FENCE`` site front_gemm, default off): fence.acq_rel.gpu right
+    # before the trigger that follows griddepcontrol.wait. Set per instance (``moe.front.compile_publish``).
+    k19_fence = False
+
     def __init__(
         self, n, k, m, rt, kq, staged, split, valid, ks=1, tg=0, ch=0
     ):  # fmt: skip
@@ -101,6 +129,12 @@ class WsGemm:
         row = (cta * self.rt + tile) * 16 + group
         kofs = (kpart * self.kq + quarter) * self.kb * 32 + part * 8
         shape = (self.nt, self.rt, self.kq, 8, 17)
+        wr = {}
+        if cutlass.const_expr(self.early_weights & 1):  # F1: register weights at entry
+            wp0 = w.iterator + row * self.k + kofs
+            for j in cutlass.range_constexpr(self.rb):
+                for h in cutlass.range_constexpr(2):
+                    wr[j, h] = self.weight_words(wp0 + h * 8 * self.k + j * 32)
         red = smem.allocate_tensor(Float32, cute.make_layout(shape), 16)
         stage = alloc(smem, Uint32, (self.rt * self.kq, max(self.staged, 1), 2, 32, 4))
         xs = recv = None
@@ -118,8 +152,8 @@ class WsGemm:
                     if s * self.ks + kpart < self.blocks:
                         cute.arch.mbarrier_init(owned.iterator + s, 1)
                         nbytes = self.parts * 512
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            owned.iterator + s, nbytes
+                        cute.arch.mbarrier_arrive_and_expect_tx(  # K-23: peers push_float into owned slots
+                            owned.iterator + s, nbytes, **K23_ARM
                         )
                 cute.arch.mbarrier_init_fence()
             cute.arch.sync_threads()
@@ -130,12 +164,14 @@ class WsGemm:
                 dst = at(stage, warp, j, h, lane, 0)
                 copy_g2s(dst, wp + h * 8 * self.k + (self.rb + j) * 32)
         cute.arch.cp_async_commit_group()
-        wr = {}
-        for j in cutlass.range_constexpr(self.rb):
-            for h in cutlass.range_constexpr(2):
-                src = wp + h * 8 * self.k + j * 32
-                wr[j, h] = load_words(src, count=4, evict_first=True)
+        if cutlass.const_expr(not (self.early_weights & 1)):
+            for j in cutlass.range_constexpr(self.rb):
+                for h in cutlass.range_constexpr(2):
+                    src = wp + h * 8 * self.k + j * 32
+                    wr[j, h] = self.weight_words(src)
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.k19_fence):
+            cute.arch.fence_acq_rel_gpu()
         cute.arch.griddepcontrol_launch_dependents()
         if cutlass.const_expr(self.grouped):
             if warp == 0:
@@ -202,6 +238,12 @@ class WsGemm:
                 cute.arch.cluster_arrive()
                 cute.arch.cluster_wait()
 
+    def weight_words(self, src):
+        """16 B of static weights: ``ld.global.nc`` (shipped) or coherent (F1 bit 2)."""
+        if self.early_weights & 2:  # Python-time choice (not traced)
+            return coherent_weight_words(src)
+        return load_words(src, count=4, evict_first=True)
+
     def tiles(self, g):
         """8-token tiles in token group ``g``."""
         return min(self.ng, self.nt - g * self.ng)
@@ -209,6 +251,8 @@ class WsGemm:
     @cute.jit
     def stage_x(self, x, xs, bars, kpart, lane):
         """Warp 0 bulk-copies every token's K slice; one barrier per token group."""
+        if cutlass.const_expr(self.tma_fence):
+            fence_proxy_async_global()  # x was written generically by the PDL predecessor; TMA reads it (K-16)
         if lane == 0:
             for g in cutlass.range_constexpr(self.groups):
                 tokens = min(self.m, (g + 1) * self.ng * 8) - g * self.ng * 8

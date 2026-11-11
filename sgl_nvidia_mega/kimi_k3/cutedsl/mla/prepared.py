@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Prepared MLA core: the packed input projection feeds the query kernel, then either
 tokenspeed_mla_decode (core "tokenspeed") or FlashInfer's trtllm-gen MLA decode (core
 "trtllm"; FP8 Q and KV as tokenspeed, FP32 softmax and accumulation) into the BF16
@@ -24,6 +25,7 @@ from .dcp import (
 )
 from .query import MlaQuery
 from .value import MlaValue
+from .head_gate import head_gate
 
 # tokenspeed (SM-filling splits) streams long contexts fast; trtllm-gen wins from B16.
 TRTLLM_CORE_BATCH, CORES = 16, ("tokenspeed", "trtllm")
@@ -31,7 +33,18 @@ _FLASHINFER: dict[tuple[torch.device, int], tuple[torch.Tensor, torch.Tensor]] =
 
 
 @cache
-def compile_core(batch, heads, pitch, specs, device, dcp=0, sms=148, q=1):
+def compile_core(
+    batch,
+    heads,
+    pitch,
+    specs,
+    device,
+    dcp=0,
+    sms=148,
+    q=1,
+    query_type=MlaQuery,
+    query_specs=(),
+):
     """CuTe kernels (query, value) of one batch of rows (``q`` per request); under DCP
     (``dcp``: its size) the query publishes and the value is DcpValue."""
     qnorm, kvnorm, qb, uk, uv, qinv, kinv, kv = (
@@ -47,12 +60,15 @@ def compile_core(batch, heads, pitch, specs, device, dcp=0, sms=148, q=1):
     latent = fake((batch, heads, 512))
     f32, s = cutlass.Float32, make_fake_stream()
     cp_async = heads == 12 and batch == 1
-    mla_query = MlaQuery(heads, batch, q_b_cp_async=cp_async, dcp=dcp)
+    mla_query = query_type(heads, batch, q_b_cp_async=cp_async, dcp=dcp)
     q_args: tuple = (projected, qnorm, kvnorm, qb, uk, kv, slots, qinv, kinv)
     q_args += (f32(1e-6), query)
     if dcp:  # this parity's q mailbox, its multicast address, rank
         mailbox = fake((64, dcp * heads, 576), None, torch.uint8)
         q_args += (mailbox, cutlass.Int64(0), cutlass.Int32(0))
+    q_args += tuple(
+        fake(shape, stride, dtype, 4) for shape, stride, dtype in query_specs
+    )
     with torch.accelerator.device_index(device):
         kernels = [cute.compile(mla_query, *q_args, s)]
         if batch > 1:
@@ -102,10 +118,12 @@ def trtllm_decode(query, cache, block_table, lengths, max_seq, scales, out):
     from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
     from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
+    from sgl_nvidia_mega.kimi_k3.compat import TRTLLM_KV_COUNTER_ROWS
+
     device, heads = query.device, query.shape[2]
     if (device, heads) not in _FLASHINFER:
         sms = torch.cuda.get_device_properties(device).multi_processor_count
-        count = get_trtllm_gen_multi_ctas_kv_counter_bytes(64, heads, sms)
+        count = get_trtllm_gen_multi_ctas_kv_counter_bytes(TRTLLM_KV_COUNTER_ROWS, heads, sms)
         workspace = torch.zeros(128 << 20, dtype=torch.int8, device=device)
         counter = torch.zeros(count, dtype=torch.uint8, device=device)
         _FLASHINFER[device, heads] = workspace, counter
@@ -161,6 +179,7 @@ class PreparedMla:
             to_cute(w, 4 if w.dtype == torch.float32 else 16) for w in self.weights
         )
         self.query_scratch, self.kernels = query_scratch, {}
+        self.query_type, self.query_buffers, self.query_views = MlaQuery, (), ()
         shapes = [(b, q) for b in pitches for q in queries if b % q == 0]
         self.cores = {(b, q): core_for(b, core, q) for b, q in shapes}
         # The split count only depends on this bound; seq_lens bound the work.
@@ -174,6 +193,8 @@ class PreparedMla:
 
     def prepare_cache(self, kv):
         specs = tuple(layout(w) for w in (*self.weights, kv.view(torch.uint8)))
+        query_specs = tuple(layout(w) for w in self.query_buffers)
+        self.query_views = tuple(to_cute(w, 4) for w in self.query_buffers)
         for batch, q in self.cores:
             device = self.device.index
             dcp = self.dcp.size if self.dcp is not None else 0
@@ -182,7 +203,11 @@ class PreparedMla:
             args = batch, self.heads, pitch, specs, device, dcp, sms, q
             query = to_cute(self.query_scratch[:batch])
             latent = to_cute(self.latent[:batch])
-            self.kernels[batch, q] = (*compile_core(*args), query, latent)
+            self.kernels[batch, q] = (
+                *compile_core(*args, self.query_type, query_specs),
+                query,
+                latent,
+            )
             if self.dcp is not None:
                 self.prepare_dcp(batch)
             if kv.is_cuda:  # compile before graph capture
@@ -240,16 +265,17 @@ class PreparedMla:
         qnorm, kvnorm, qb, uk, uv, qinv, kinv = self.views
         q_slots, x = to_cute(slots[:batch], 8), to_cute(projected[:, :2112])
         q_args = (x, qnorm, kvnorm, qb, uk, kv, q_slots, qinv, kinv, self.eps, query)
-        out_view, gate = to_cute(out), to_cute(projected[:, 2112:])
+        out_view = to_cute(out)
         lens = to_cute(lengths[:reqs], 4)
         if self.dcp is not None:  # DcpValue zeroes padded requests (global lengths)
             publish, ((rows, rows_lse), boxes, peers), ids = self.dcp_args[batch]
             mq(*q_args, *publish, s)
             self.stock_core(cache, block_table, lengths, batch, q, totals)
+            gate = to_cute(head_gate(projected, self.heads))  # read right before its reader (QF-G18 join)
             v_args = (rows, rows_lse, lens, *boxes, *peers, publish[0], uv, gate)
             v(*v_args, to_cute(totals[:reqs], 4), out_view, *ids, s)
             return out
-        mq(*q_args, s)
+        mq(*q_args, *self.query_views, s)
         self.stock_core(cache, block_table, lengths, batch, q)
-        v(latent, uv, gate, lens, out_view, s)
+        v(latent, uv, to_cute(head_gate(projected, self.heads)), lens, out_view, s)
         return out

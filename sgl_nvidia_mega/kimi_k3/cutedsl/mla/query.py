@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Cluster MLA query RMSNorm, Q_B projection, W_UK absorption and paged FP8 KV insert.
 Static weights load before the PDL wait; current-token data is consumed after it."""
+
+import os
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int64
+from cutlass._mlir.dialects import nvvm
 
 from ..common.primitives import (
     alloc,
@@ -44,6 +48,22 @@ KP = 1536 + 32  # padded Q_B / x row (elements): 3136 B, conflict-free 16 B frag
 # its 16-request tiles beat FP32 FMAs from B4 at 12 heads and from B6 at 6 heads.
 TILED_FROM = {12: 4, 6: 6}
 Q_SENT = 0xFFFFFFFF  # q mailbox sentinel: four FP8 0xFF bytes, never written
+# KNOWN K-22a: tiled()'s peers write `qn` with DSMEM bulk copies (async proxy). As built (mode "0") qn aliases dead
+# x rows this CTA read and wrote with generic accesses, and its first cluster arrive is .relaxed with the only
+# proxy fence after it: no proxy fence and no release order those accesses before the peers' writes (PTX 8.6).
+# K31MK_MLAQ_K22: "0" (default) as built; "C" qn gets its own SMEM (no slot reuse in the CTA lifetime) where it fits:
+# at 64-request tiles x + qn would need 240,640 B > 232,448 B per CTA, so "C" applies "A" there; "A" keeps the alias,
+# and every thread runs fence.proxy.async.shared::cta before a .release first arrive. Outputs are bitwise those of
+# "0" (same data, same ops; only where qn lives or the arrive's ordering changes).
+K22_FIX = os.environ.get("K31MK_MLAQ_K22", "0")
+
+# K-23g: tiled()'s barq is
+# completed by the peers' DSMEM bulk copies (cp.async.bulk.shared::cluster ... complete_tx) but was armed at the default
+# .release.cta scope before a .relaxed first cluster arrive (modes "0" and "C"): the arm is not morally strong with a
+# peer's complete_tx (PTX 8.7), so when a peer's bytes land before the arm the wait does not order them (8.9.2, 8.9.4).
+# Arming at .relaxed.cluster closes it (litmus-tested: forbidden). Default on, in every K22 mode.
+# The B1 kernel's barq (fma path) is not changed here.
+K23_ARM = {"relaxed": True, "scope": nvvm.MemScopeKind.CLUSTER}
 
 
 class MlaQuery:
@@ -65,6 +85,7 @@ class MlaQuery:
         *,
         q_b_cp_async: bool = False,
         dcp: int = 0,
+        k22: str | None = None,
     ):
         tiled = TILED_FROM[heads]
         self.heads, self.batch, self.wide = heads, batch, batch >= tiled
@@ -79,6 +100,11 @@ class MlaQuery:
         carveout = 100 if batch > 1 else None
         self.options = dict(cluster=self.cluster, preferred_smem_carveout=carveout)
         self.q_b_cp_async = q_b_cp_async
+        self.k22 = K22_FIX if k22 is None else k22  # K-22a mode of tiled(); see K22_FIX
+        if self.k22 not in ("0", "C", "A"):
+            raise ValueError(f"K31MK_MLAQ_K22 must be 0, C or A, got {self.k22!r}")
+        if self.k22 == "C" and self.tokens > 32:
+            self.k22 = "A"
 
     @cute.jit
     def __call__(self, *args):
@@ -88,6 +114,11 @@ class MlaQuery:
     @cute.jit
     def live(self, token):
         return cutlass.const_expr(not self.wide) or token < self.batch
+
+    @cute.jit
+    def finish(self, args, tid, part, head, tok0):
+        """Model-specific side output; the K3 query has none."""
+        pass
 
     @cute.jit
     def publish(self, args, tok0, tid):
@@ -270,6 +301,7 @@ class MlaQuery:
         self.insert(args, ss, tok0, part, valid, tid)
         if cutlass.const_expr(self.dcp):
             self.gathered(args, tid)
+        self.finish(args, tid, part, head, tok0)
 
     @cute.jit
     def insert(self, args, ss, tok0, j, valid, tid):
@@ -338,11 +370,14 @@ class MlaQuery:
         # and the six producers' (peers write them only after our cluster arrival).
         red = view(xq.iterator, 0, Float32, (8, T * R // 32, 32), (T * R, 32, 1))
         qblk = view(xq.iterator, 8 * T * R * 4, BFloat16, (T, R), (R, 1))
-        qn = view(xq.iterator, 9 * T * R * 4, BFloat16, (senders, T, R), (T * R, R, 1))
+        if cutlass.const_expr(self.k22 == "C"):  # K-22a fix C: SMEM no generic access of this CTA touches first
+            qn = alloc(smem, BFloat16, (senders, T, R), 128)
+        else:
+            qn = view(xq.iterator, 9 * T * R * 4, BFloat16, (senders, T, R), (T * R, R, 1))
         if tid == 0:
             cute.arch.mbarrier_init(barq, 1)
             cute.arch.mbarrier_init_fence()
-            cute.arch.mbarrier_arrive_and_expect_tx(barq, senders * T * R * 2)
+            cute.arch.mbarrier_arrive_and_expect_tx(barq, senders * T * R * 2, **K23_ARM)  # K-23g: peers' bulk copies
         # Split-K Q_B: warp w owns k = 192w..192w+191 (8 values per lane and 32-wide
         # chunk; the x fragments use the same permutation). L2 now, registers later.
         rows = head * 192 + part * R + group
@@ -422,7 +457,11 @@ class MlaQuery:
                         b = (z[n][2 * s], z[n][2 * s + 1])
                         mma_into(acc[m * 3 + n, None], a, b, bf16=True)
         cute.arch.sync_threads()
-        cute.arch.cluster_arrive_relaxed()  # x is consumed: peers may fill qn
+        if cutlass.const_expr(self.k22 == "A"):  # K-22a fix A: this thread's x accesses before the peers' bulk writes
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.cluster_arrive()  # .release: x is consumed, peers may fill qn
+        else:
+            cute.arch.cluster_arrive_relaxed()  # x is consumed: peers may fill qn
         for i in cutlass.range_constexpr(MT * 12):
             red[warp, i, lane] = acc[i // 4, i % 4]
         cute.arch.sync_threads()
@@ -472,3 +511,4 @@ class MlaQuery:
         cute.arch.cluster_wait()
         if cutlass.const_expr(self.dcp):
             self.gathered(args, tid)
+        self.finish(args, tid, part, head, tok0)

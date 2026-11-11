@@ -13,7 +13,29 @@ every mbarrier hand-off of tcgen05 work.
 
 Each cluster rank accumulates an exact K slice in FP32; peers publish partials to
 rank 0 through DSMEM, which reduces, casts and stores once. Kernel-M carries public N
-and kernel-N public M."""
+and kernel-N public M.
+
+``fenced_trigger`` ("fix A", default 0 = shipped: the weight warp, which never
+waits, triggers after issuing its weight stages): the CTA's only PDL trigger is issued
+by a thread that has executed ``griddepcontrol.wait``, behind ``fence.acq_rel.gpu``.
+PTX 9.7.15.14: a release fence before ``launch_dependents`` in program order
+synchronizes with the dependent grid's start (same memory sync domain, gpu scope), and
+only a CTA's first trigger has an effect. So a dependent's pre-wait reads (the early KDA
+verify's slot table, checkpoint and conv taps) are ordered after everything this grid's
+wait orders. Where the trigger sits: 1 = the activation warp right after its wait (the
+fence delays its first activation TMA); 2 = the idle warp 3 (wait, fence, trigger; same
+time as 1, off the activation path); 3 = the weight warp after its weight stages, where
+the shipped trigger sits (its wait then returns at once whenever K tiles > stages).
+
+``act_fuse`` (default False = the shipped kernel, unchanged): a merged
+gate_up weight [2I, K] (gate rows 0..I-1, up rows I..2I-1) and C = SiLU(gate) * up [rows, I].
+CTA i loads gate rows [i*h, i*h+h) and up rows [I+i*h, I+i*h+h) (h = mma_m / 2) as two
+half-height boxes into one A tile (no weight relayout); the owner rounds the reduced tile to
+BF16 (the stock gate_up output), stages it in SMEM, and each epilogue thread computes
+bf16(silu(gate) * up) with the sglang act_and_mul (--use_fast_math) instruction sequence."""
+
+
+import functools
 
 import cuda.bindings.driver as _cuda
 import cutlass
@@ -25,6 +47,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
+from ..common.primitives import asm
 from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
     OWNER_RANK,
     SplitKTactic,
@@ -32,6 +55,28 @@ from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
 )
 
 CTA_K, ATOM_K = 128, 64  # K per tile; K per 128-byte swizzle atom (one A box)
+LARGE_SMEM_ATTRIBUTE = "CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK"
+
+
+@functools.lru_cache(maxsize=None)
+def _large_smem_alloc(ordinal):
+    attr = getattr(_cuda.CUdevice_attribute, LARGE_SMEM_ATTRIBUTE, None)
+    if attr is None:
+        raise RuntimeError(f"large-SMEM mode: this cuda-python has no {LARGE_SMEM_ATTRIBUTE}")
+    status, value = _cuda.cuDeviceGetAttribute(attr, ordinal)
+    if status != _cuda.CUresult.CUDA_SUCCESS or int(value) <= 0:
+        raise RuntimeError(f"large-SMEM mode: {LARGE_SMEM_ATTRIBUTE} unavailable on device {ordinal} ({status}, {value})")
+    return int(value)
+
+
+def large_smem_alloc(device=None):
+    """Per-block shared memory of the large-SMEM mode (the driver's MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK of ``device``,
+    default the current CUDA device); usable only with the function's SHARED_MEMORY_MODE = ALLOW_OVERSIZED."""
+    if device is None:
+        import torch
+
+        device = torch.cuda.current_device()
+    return _large_smem_alloc(int(getattr(device, "index", device)))
 
 __all__ = ["SplitKTactic", "SplitKGemm"]
 
@@ -70,9 +115,71 @@ def _wait_cluster(mbar, phase, *, loc=None, ip=None):
 
 
 @dsl_user_op
+def _arm_cluster(mbar, tx_bytes, *, loc=None, ip=None):
+    """K-23 fix (always on): the owner arms
+    bar_reduce after the cluster barrier, so peers' remote ``st.async`` complete_tx can land first; armed at
+    CLUSTER scope the arm and those complete_tx are morally strong (PTX 8.7) and the owner's
+    ``try_wait.acquire.cluster`` orders the peers' partials whichever order they take (litmus-tested: forbidden)."""
+    code = "{ .reg .b64 st; mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64 st, [$0], $1; }"
+    _asm(code, "r,r,~{memory}", [mbar.toint().ir_value(), Int32(tx_bytes).ir_value()], loc, ip)
+
+
+@dsl_user_op
+def _fenced_launch_dependents(*, loc=None, ip=None):
+    """Acquire-release fence then trigger, one asm block so nothing separates them.
+    ``fence.acq_rel.gpu`` (not ``.release``): the dependent's pre-wait
+    reads then stay ordered even if ``griddepcontrol.wait`` is read as a relaxed
+    observation of the predecessors' completion (litmus-tested)."""
+    llvm.inline_asm(
+        None, [], "fence.acq_rel.gpu;\n\tgriddepcontrol.launch_dependents;", "~{memory}",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )  # fmt: skip
+
+
+# K-42 (fix A modes 1 / 2): the warp that triggers after its own PDL wait (the activation warp in mode 1, warp 3 in
+# mode 2) first waits on this named barrier (64 threads), which the MMA warp arrives on once its tensor memory is
+# allocated, so a dependent CTA on this SM cannot take tensor memory first. Modes 0 / 3 trigger from the weight warp,
+# which is already behind the MMA warp's first commit (its bar_empty wait on tile ``stages``), and compile unchanged.
+TRIGGER_BARRIER = 4
+
+
+@dsl_user_op
+def _trigger_barrier(arrive, *, loc=None, ip=None):
+    op = "arrive" if arrive else "sync"
+    llvm.inline_asm(
+        None, [], f"bar.{op} {TRIGGER_BARRIER}, 64;", "~{memory}",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )  # fmt: skip
+
+
+@dsl_user_op
+def _fence_proxy_async_global(*, loc=None, ip=None):
+    """K-16 (site KDA-1): the activation TMAs read B, which the PDL predecessor
+    wrote with generic stores; the issuing warp orders the generic and async proxies for global memory
+    after ``griddepcontrol.wait`` and before its first TMA (PTX 8.6 proxies, 9.7.15.4 fence.proxy)."""
+    llvm.inline_asm(
+        None, [], "fence.proxy.async.global;", "~{memory}",
+        has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc, ip=ip,
+    )  # fmt: skip
+
+
+@dsl_user_op
 def _fence_tcgen05(*, before=False, loc=None, ip=None):
     side = "before" if before else "after"
     _asm(f"tcgen05.fence::{side}_thread_sync;", "", [], loc, ip)
+
+
+@asm(cutlass.Float32, pure=True)
+def _silu_mul_fast(gate, up):
+    """sglang act_and_mul_kernel<bf16, kSiLU> (JIT, --use_fast_math): silu(g) = g / (1 + expf(-g)) -> nvcc's
+    mul.ftz (g * -log2e), ex2.approx.ftz, add.ftz 1, div.approx.ftz; then mul.ftz by up (PTX of nvcc 12.6 -O3
+    --use_fast_math; bitwise equality to the served kernel is a GPU test, not this comment)."""
+    code = "{ .reg .f32 t,e,d,s; mul.ftz.f32 t,$1,0fbfb8aa3b; ex2.approx.ftz.f32 e,t; "
+    code += "add.ftz.f32 d,e,0f3f800000; div.approx.ftz.f32 s,$1,d; mul.ftz.f32 $0,$2,s; }"
+    return code, "=f,f,f", (gate, up)
 
 
 def _smem(dtype, size, alignment, layout=None):
@@ -84,8 +191,29 @@ class SplitKGemm:
     """BF16 GEMM with a cluster-local split-K reduction; ``a_map`` is the device
     address of A's tensor map (box {64, mma_m}, 128-byte swizzle)."""
 
-    def __init__(self, *, tactic: SplitKTactic):
+    def __init__(
+        self, *, tactic: SplitKTactic, fenced_trigger: int = 0, proxy_fences: bool = False, act_fuse: bool = False,
+        oversized: bool = False,
+    ):  # fmt: skip
+        assert int(fenced_trigger) in (0, 1, 2, 3), fenced_trigger
+        self.fenced_trigger = int(fenced_trigger)
+        # SiLU-mul epilogue over a merged gate_up weight (see the module doc); default off.
+        self.act_fuse = bool(act_fuse)
+        if self.act_fuse:
+            assert tactic.mma_m in (64, 128) and tactic.mma_m * tactic.mma_n % (2 * 128) == 0, tactic
+        # OV (default off): launch with the large-SMEM allocation so a tactic can hold more
+        # weight stages before its PDL wait. Only the host launch's SMEM size changes; the caller sets the function's
+        # SHARED_MEMORY_MODE to ALLOW_OVERSIZED before the first launch (projection.py).
+        self.smem_alloc = large_smem_alloc() if oversized else utils.get_smem_capacity_in_bytes("sm_100")
+        # K-16 fence on the B load (always on).
+        self.k16_fence = True
+        # K-23 (on since KDA-6): the owner's late bar_reduce arm at cluster scope.
+        self.k23_arm = True
         self.acc_dtype = cutlass.Float32
+        # griddepcontrol is not a proxy-preserving boundary (PTX 8.9.4): with proxy_fences the kernel fences
+        # generic <-> async itself around its TMA reads of B and after its generic stores of C,
+        # for producers / consumers that do not fence (stock kernels).
+        self.proxy_fences = proxy_fences
         self.cta_m, self.cta_n, self.cta_k = tactic.mma_m, tactic.mma_n, CTA_K
         self.num_ab_stage, self.split_k = tactic.ab_stages, tactic.split_k
         self.threads_per_cta, self.epilog_threads = 256, 128
@@ -104,16 +232,17 @@ class SplitKGemm:
         self, a: cute.Tensor, b: cute.Tensor, c: cute.Tensor, bias: cute.Tensor,
         a_map: cutlass.Int64, stream: _cuda.CUstream,
     ):  # fmt: skip
-        # Grid-y packs output-N tile and cluster rank.
+        # Grid-y packs output-N tile and cluster rank. act_fuse: one CTA row per mma_m weight rows (C has half).
+        m_rows = a.layout.shape[0] if cutlass.const_expr(self.act_fuse) else c.layout.shape[0]
         self.kernel(a, b, c, bias, a_map).launch(
             grid=(
-                cute.ceil_div(c.layout.shape[0], self.cta_m),
+                cute.ceil_div(m_rows, self.cta_m),
                 cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
                 c.layout.shape[2],
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(self.smem_alloc),
             stream=stream,
             use_pdl=True,
         )
@@ -156,6 +285,12 @@ class SplitKGemm:
         if cutlass.const_expr(self.split_k > 1):
             mailbox = _smem(cutlass.Float32, self.mailbox_elements, 128)
             bar_reduce = _smem(cutlass.Int64, 1, 8).iterator
+        stage_d = sA  # act_fuse only: the owner's BF16 tile, (mma_m, mma_n) M-major
+        if cutlass.const_expr(self.act_fuse):
+            stage_d = _smem(
+                cutlass.BFloat16, None, 16,
+                cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)),
+            )  # fmt: skip
 
         if warp_idx == 0:
             with cute.arch.elect_one():
@@ -185,7 +320,12 @@ class SplitKGemm:
         # Warp 3 is idle; warps 4-7 run the epilogue.
         tiles = (k_tile_start, k_tile_count)
         if warp_idx == 0:
-            self.weight_warp(bar_full, bar_empty, sA, a_map, bidx * self.cta_m, *tiles)
+            if cutlass.const_expr(self.act_fuse):
+                half = self.cta_m // 2
+                up0 = cute.size(mA, mode=[0]) // 2 + bidx * half
+                self.weight_warp_pair(bar_full, bar_empty, sA, a_map, bidx * half, up0, *tiles)
+            else:
+                self.weight_warp(bar_full, bar_empty, sA, a_map, bidx * self.cta_m, *tiles)
         elif warp_idx == 1:
             b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx))
             b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
@@ -197,12 +337,29 @@ class SplitKGemm:
                 tmem_base_ptr, acc_layout, k_blocks, k_tile_count,
             )  # fmt: skip
         elif warp_idx >= 4:
-            tile = cute.local_tile(mC, (self.cta_m, self.cta_n), (bidx, n_idx, l_idx))
-            self.epilog_warp(
-                bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, tile,
-                cute.arch.thread_idx()[0] - 128, mC.element_type,
-                utils.LayoutEnum.from_tensor(mC), mailbox, bar_reduce, split_rank,
-            )  # fmt: skip
+            if cutlass.const_expr(self.act_fuse):
+                tile = cute.local_tile(mC, (self.cta_m // 2, self.cta_n), (bidx, n_idx, l_idx))
+                rows_left = cute.size(mC, mode=[1]) - n_idx * self.cta_n
+                self.epilog_warp_act(
+                    bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, tile,
+                    cute.arch.thread_idx()[0] - 128, mC.element_type,
+                    utils.LayoutEnum.from_tensor(mC), mailbox, bar_reduce, split_rank, stage_d, rows_left,
+                )  # fmt: skip
+            else:
+                tile = cute.local_tile(mC, (self.cta_m, self.cta_n), (bidx, n_idx, l_idx))
+                self.epilog_warp(
+                    bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, tile,
+                    cute.arch.thread_idx()[0] - 128, mC.element_type,
+                    utils.LayoutEnum.from_tensor(mC), mailbox, bar_reduce, split_rank,
+                )  # fmt: skip
+        # Fix A mode 2: the idle warp 3 waits, fences and triggers. Compiled in only for
+        # mode 2, outside the dispatch chain, so every other mode keeps the shipped chain
+        # (default off: PTX identity, FX-3).
+        if cutlass.const_expr(self.fenced_trigger == 2):
+            if warp_idx == 3:
+                cute.arch.griddepcontrol_wait()
+                _trigger_barrier(False)  # K-42: after the MMA warp's TMEM alloc
+                _fenced_launch_dependents()
 
     @cute.experimental.jit
     def weight_warp(
@@ -231,7 +388,49 @@ class SplitKGemm:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
 
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(self.fenced_trigger == 3):
+            cute.arch.griddepcontrol_wait()
+            _fenced_launch_dependents()
+        elif cutlass.const_expr(self.fenced_trigger == 0):
+            cute.arch.griddepcontrol_launch_dependents()
+        self.drain(bar_empty, empty_phase, k_tile_count)
+
+    @cute.experimental.jit
+    def weight_warp_pair(
+        self, bar_full, bar_empty, s_tile: cute.Tensor, a_map: cutlass.Int64,
+        gate0: cutlass.Int32, up0: cutlass.Int32, k_tile_start: cutlass.Int32, k_tile_count: cutlass.Int32,
+    ):  # fmt: skip
+        """act_fuse A: per 64-K atom, a {64, mma_m/2} gate box into tile rows [0, h) and an up box into [h, 2h)
+        (a_map's box is {64, mma_m/2}; h rows x 128 B = a whole number of 1024 B swizzle atoms, so each half keeps
+        the full box's SW128 phase). Same stage bytes, same evict_first policy, same PDL trigger as weight_warp."""
+        stages = self.num_ab_stage
+        half = self.cta_m // 2
+        stage_bytes = cute.size_in_bytes(
+            s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
+        )
+        _acquire_tensor_map(a_map)
+        empty_phase = cutlass.Int32(1)
+        for k_tile in cutlass.range(k_tile_count, unroll=1):
+            stage = k_tile % stages
+            cute.arch.mbarrier_wait(bar_empty + stage, empty_phase)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(bar_full + stage, stage_bytes)
+            with cute.arch.elect_one():
+                k0 = (k_tile_start + k_tile) * self.cta_k
+                tile = s_tile[None, None, None, stage].iterator
+                for atom in cutlass.range_constexpr(self.cta_k // ATOM_K):
+                    box, mbar = tile + atom * self.cta_m * ATOM_K, bar_full + stage
+                    k = k0 + atom * ATOM_K
+                    _tma_load_evict_first(box, mbar, a_map, k, gate0)
+                    _tma_load_evict_first(box + half * ATOM_K, mbar, a_map, k, up0)
+            if stage == stages - 1:
+                empty_phase = empty_phase ^ 1
+
+        if cutlass.const_expr(self.fenced_trigger == 3):
+            cute.arch.griddepcontrol_wait()
+            _fenced_launch_dependents()
+        elif cutlass.const_expr(self.fenced_trigger == 0):
+            cute.arch.griddepcontrol_launch_dependents()
         self.drain(bar_empty, empty_phase, k_tile_count)
 
     @cute.experimental.jit
@@ -246,6 +445,13 @@ class SplitKGemm:
             s_tile.element_type, cute.slice_(s_tile.layout, (None, None, None, 0))
         )
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.k16_fence):  # K-16: B was written generically upstream; TMA reads it
+            _fence_proxy_async_global()
+        if cutlass.const_expr(self.fenced_trigger == 1):
+            _trigger_barrier(False)  # K-42: after the MMA warp's TMEM alloc
+            _fenced_launch_dependents()
+        if cutlass.const_expr(self.proxy_fences):
+            _fence_proxy_async_global()  # D1: predecessor grids' generic stores -> these TMA reads
         empty_phase = cutlass.Int32(1)
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % stages
@@ -263,6 +469,8 @@ class SplitKGemm:
             if stage == stages - 1:
                 empty_phase = empty_phase ^ 1
         self.drain(bar_empty, empty_phase, k_tile_count)
+        if cutlass.const_expr(self.proxy_fences):
+            _fence_proxy_async_global()  # D2: these consumed TMA reads -> later grids' generic overwrites
 
     @cute.experimental.jit
     def drain(self, bar_empty, empty_phase: cutlass.Int32, k_tile_count: cutlass.Int32):
@@ -284,6 +492,8 @@ class SplitKGemm:
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=False)
         _fence_tcgen05(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
+        if cutlass.const_expr(self.fenced_trigger in (1, 2)):  # K-42: the triggering warp waits for this
+            _trigger_barrier(True)
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
 
         tmem_ptr = cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr)
@@ -368,7 +578,10 @@ class SplitKGemm:
             else:
                 if epi_tid == 0:
                     expected = self.expected_transaction_bytes
-                    cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, expected)
+                    if cutlass.const_expr(self.k23_arm):
+                        _arm_cluster(bar_reduce, expected)
+                    else:
+                        cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, expected)
                 _wait_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for i in cutlass.range_constexpr(vpt):
@@ -378,3 +591,83 @@ class SplitKGemm:
             rD.store(rAcc.load().to(c_dtype))
             # Preserve TMEM coordinates; the copy predicates output tails.
             cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+            if cutlass.const_expr(self.proxy_fences):
+                _fence_proxy_async_global()  # D3: these generic stores -> successors' TMA reads
+
+    @cute.experimental.jit
+    def epilog_warp_act(
+        self, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr,
+        acc_layout: cutlass.Constexpr, gO_tile: cute.Tensor, epi_tid: cutlass.Int32,
+        c_dtype: cutlass.Constexpr, d_layout: cutlass.Constexpr, mailbox, bar_reduce,
+        split_rank: cutlass.Int32, stage_d: cute.Tensor, rows_left: cutlass.Int32,
+    ):  # fmt: skip
+        """epilog_warp up to the owner's BF16 cast (same TMEM load, same rank-order reduction, same cast); then the
+        tile goes to SMEM, the 4 epilogue warps sync (named barrier 1), and thread t computes outputs t, t + 128, ...
+        of the (mma_m / 2, mma_n) act tile: j = idx % h (feature), n = idx // h (row); gate = tile[j, n],
+        up = tile[h + j, n]. Rows past the tensor's end are not stored."""
+        cute.arch.mbarrier_arrive(bar_tmem_alloc)
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _fence_tcgen05()
+
+        acc_view = cute.make_tensor(
+            cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
+            acc_layout,
+        )[((None, None), 0, 0, 0)]
+        epi_tile = (self.cta_m, self.cta_n)
+        load_op = sm100_utils.get_tmem_load_op(
+            (self.cta_m, self.cta_n, self.cta_k), d_layout, c_dtype, self.acc_dtype,
+            epi_tile, False,
+        )  # fmt: skip
+        tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(load_op, acc_view)
+        sD_epi = cute.flat_divide(stage_d, epi_tile)
+
+        rmem_layout = cute_ext.make_t2r_rmem_layout(tiled_copy_t2r, sD_epi, epi_tid)
+        rmem = cute.AddressSpace.rmem
+        rAcc = cute_ext.allocate(self.acc_dtype, rmem, rmem_layout, alignment=32)
+        rD = cute_ext.allocate(c_dtype, rmem, rmem_layout, alignment=32)
+        thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
+
+        cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        _fence_tcgen05()
+        cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
+        cute.arch.fence_view_async_tmem_load()
+        _fence_tcgen05(before=True)
+        cute.arch.mbarrier_arrive(bar_tmem_alloc)
+
+        if cutlass.const_expr(self.split_k > 1):
+            vpt = cutlass.const_expr(cute.size(rmem_layout))
+            vpp = cutlass.const_expr(self.epilog_threads * vpt)
+            if split_rank != OWNER_RANK:
+                for i in cutlass.range_constexpr(0, vpt, 4):
+                    words = (rAcc[i], rAcc[i + 1], rAcc[i + 2], rAcc[i + 3])
+                    slot = mailbox.iterator + (split_rank - Int32(1)) * vpp
+                    slot = slot + epi_tid * vpt + i
+                    _store_shared_remote_v4(*words, slot, bar_reduce, Int32(OWNER_RANK))
+            else:
+                if epi_tid == 0:
+                    expected = self.expected_transaction_bytes
+                    if cutlass.const_expr(self.k23_arm):
+                        _arm_cluster(bar_reduce, expected)
+                    else:
+                        cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, expected)
+                _wait_cluster(bar_reduce, Int32(0))
+                for peer in cutlass.range_constexpr(self.split_k - 1):
+                    for i in cutlass.range_constexpr(vpt):
+                        rAcc[i] = rAcc[i] + mailbox[peer * vpp + epi_tid * vpt + i]
+
+        if split_rank == OWNER_RANK:
+            rD.store(rAcc.load().to(c_dtype))
+            cute_ext.partition_and_copy(thr_t2r, rD, sD_epi[None, None, 0, 0])
+            # The 128 epilogue threads (warps 4-7) only: every staged value before any read of it.
+            cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
+            half = self.cta_m // 2
+            for i in cutlass.range_constexpr(half * self.cta_n // self.epilog_threads):
+                idx = epi_tid + i * self.epilog_threads
+                j = idx % half
+                n = idx // half
+                if n < rows_left:
+                    gate = stage_d[j, n].to(cutlass.Float32)
+                    up = stage_d[half + j, n].to(cutlass.Float32)
+                    gO_tile[j, n] = _silu_mul_fast(gate, up).to(c_dtype)
+            if cutlass.const_expr(self.proxy_fences):
+                _fence_proxy_async_global()  # D3: these generic stores -> successors' TMA reads

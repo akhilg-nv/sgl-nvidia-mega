@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Inline-PTX, memory, synchronization and math helpers of the decode kernels."""
 
 import math
@@ -167,7 +168,7 @@ def inv_rms(value, eps, *, m8=False):
 @asm(Float32, pure=True)
 def query_norm_rsqrt(total: Float32, eps: Float32):
     code = "{ .reg .f32 mean; div.rn.f32 mean,$1,0f44c00000; "
-    code += "add.f32 mean,mean,$2; rsqrt.approx.f32 $0,mean; }"
+    code += "add.f32 mean,mean,$2; rsqrt.approx.ftz.f32 $0,mean; }"
     return code, "=f,f,f", (total, eps)
 
 
@@ -632,6 +633,13 @@ def multicast_words(address, words, *, kind="f32"):
     constraints = "l" + (",f" if f32 else ",r") * len(words) + ",~{memory}"
     code = f"multimem.st.relaxed.sys.global{vector}.{kind} [$0],{registers};"
     return code, constraints, (Int64(address), *values)
+
+
+@asm()
+def fence_proxy_async_global():
+    """Generic <-> async proxy fence for global memory (PTX 9.7.15.4). Run it in the thread that issues a TMA /
+    cp.async.bulk read of data a PDL predecessor wrote generically, after griddepcontrol.wait (known issue K-16)."""
+    return "fence.proxy.async.global;", "~{memory}", ()
 
 
 @asm()

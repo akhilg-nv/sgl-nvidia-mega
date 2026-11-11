@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Top16 routing (threshold, regional candidates and exact composite ranking) and the
 helpers the TP8 and TP16 small-batch fronts share."""
 
@@ -10,6 +11,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 
 from ..common.primitives import (
+    asm,
     bits_float,
     copy_evict,
     float_bits,
@@ -23,6 +25,30 @@ from ..common.primitives import (
     view,
     zeros,
 )
+
+
+@asm(Float32, pure=True)
+def router_sigmoid(value):
+    """Stock route_radix's __fdividef(1, 1 + __expf(-x)), without fast-math."""
+    code = "{ .reg .f32 x,e,d; mul.f32 x,$1,0fbfb8aa3b; "
+    code += "ex2.approx.f32 e,x; add.f32 d,e,0f3f800000; "
+    code += "div.approx.f32 $0,0f3f800000,d; }"
+    return code, "=f,f", (Float32(value),)
+
+
+@asm(Float32, pure=True)
+def router_add(score, bias):
+    return "add.rn.f32 $0,$1,$2;", "=f,f,f", (score, bias)
+
+
+@asm(Float32, pure=True)
+def router_weight(score, total, scale, *, renorm=True):
+    code = "mul.f32 $0,$1,$3;"
+    if renorm:
+        code = "{ .reg .pred p; .reg .f32 d,w; setp.gt.f32 p,$2,0f00000000; "
+        code += "selp.f32 d,$2,0f3f800000,p; div.rn.f32 w,$1,d; "
+        code += "mul.f32 $0,w,$3; }"
+    return code, "=f,f,f,f", (score, total, scale)
 
 
 @cute.jit
@@ -76,12 +102,11 @@ def gather_x(xmoe, par, cta, dst, first_chunk, active, tokens=1, h2=None):
 
 @cute.jit
 def score_record(score, biased):
-    """Published (score, score+bias) bits; NaN or 0x80000000 bits become (0, -inf)."""
-    score_bits, biased_bits = Uint32(float_bits(score)), Uint32(float_bits(biased))
-    sentinel = (score_bits == Uint32(0x80000000)) | (biased_bits == Uint32(0x80000000))
-    if sentinel | (score != score) | (biased != biased):
-        score_bits, biased_bits = Uint32(0), Uint32(0xFF800000)
-    return score_bits, biased_bits
+    """Stock NaN key floor and signed-zero canonicalization; avoid the empty marker."""
+    biased = biased if biased == biased else Float32(-1e30)
+    score = Float32(0) if score == 0 else score
+    biased = Float32(0) if biased == 0 else biased
+    return Uint32(float_bits(score)), Uint32(float_bits(biased))
 
 
 @cute.jit

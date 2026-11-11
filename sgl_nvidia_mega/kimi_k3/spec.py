@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
-"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103."""
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Kimi K3 packed-MXFP4 megakernel spec for GB300/SM103 and VR200/SM107."""
 
 from __future__ import annotations
 
 import math
 from typing import TYPE_CHECKING, Any, cast
 
-from sglang.srt.megakernels.spec import (
+try:
+    import sglang.kernels.plugin_kernels.nvidia.spec as _host_spec
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    import sglang.srt.megakernels.spec as _host_spec
+from sgl_nvidia_mega.kimi_k3._host import (  # noqa: E402
     BuildContext,
     BuiltMegakernel,
     Feature,
@@ -19,16 +24,20 @@ from sglang.srt.megakernels.spec import (
 )
 from sglang.srt.runtime_context import get_model
 
+from sgl_nvidia_mega.kimi_k3.shapes import enabled_tp_sizes
+
 if TYPE_CHECKING:
-    from sglang.srt.megakernels.binding import PreparationView
+    from sgl_nvidia_mega.kimi_k3._host import PreparationView
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
-# Keep this independent of the host constant so find_spec rejects incompatibility.
-REQUIRED_MEGAKERNEL_API_VERSION = 1
+# Keep this independent of the host constant so find_spec rejects incompatibility: the
+# built objects offer API 2's optional EAGLE entries and graph_variants (all None), so
+# a host with that contract (it defines ENTRIES) gets 2, an older one 1.
+REQUIRED_MEGAKERNEL_API_VERSION = 2 if hasattr(_host_spec, "ENTRIES") else 1
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
-    "srt/megakernels/spec.py": (
+    "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "BuildContext",
         "BuiltMegakernel",
         "Feature",
@@ -48,7 +57,7 @@ SGLANG_READS = {
         "view",
         "widths",
     ),
-    "srt/megakernels/binding.py": ("PreparationView",),
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": ("PreparationView",),
     "srt/runtime_context.py": ("get_model",),
     "srt/arg_groups/fields/*.py": (
         "context_length",
@@ -147,6 +156,8 @@ class _Built:
     """Top-level model-forward replacement for the exact decode shapes served."""
 
     draft_sampler = None
+    # Megakernel API 2: no EAGLE entries, no graph variants of the host's runners.
+    draft_loop = draft_extend = begin_draft_round = graph_variants = None
 
     def __init__(self, model: Any, resources: Any, widths: tuple[int, ...]):
         from .executor import KimiK3MegakernelExecutor
@@ -210,6 +221,9 @@ def _prepare(built: BuiltMegakernel, view: PreparationView) -> None:
     if view.hybrid is None:
         raise ValueError("Kimi K3 megakernel requires a hybrid MLA/KDA pool")
     cast(_Built, built).resources.bind(view.hybrid)
+    from . import preload
+
+    preload.at_prepare()
 
 
 def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
@@ -240,8 +254,8 @@ def _build(model: Any, hf_config: Any, context: BuildContext) -> _Built:
 SPEC = MegakernelSpec(
     name="Kimi K3 packed-MXFP4",
     requires=Requirements(
-        isas=frozenset({"sm_103"}),
-        tp_sizes=frozenset({8}),
+        isas=frozenset({"sm_103", "sm_107"}),
+        tp_sizes=enabled_tp_sizes(),  # TP16 only with K31MK_TP16=1
         resident_blocks=152,
         dtypes=frozenset({"bfloat16"}),
         decode_graph_backends=frozenset({"full"}),

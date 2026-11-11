@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Small-batch MoE chains: front -> routed experts -> (shared expert) -> polling tail.
 
 TP8 B1: ``MoeFrontTP8`` -> ``ClusterExpertsTP8`` -> ``MoeSharedTP8`` -> ``MoeTail``
@@ -19,9 +20,9 @@ from cutlass.cute.runtime import make_fake_stream
 
 from ...common.host import fake, layout, stream, to_cute
 from ...oproj.prepared import OprojMailbox
-from ..tail_runtime import POLL_CAP, compile_tail
+from ..tail_runtime import CAP, POLL_CAP, compile_tail
 from .experts import ClusterExpertsTP8, ClusterExpertsTP16
-from .front_tp8 import MoeFrontTP8, MoeSharedTP8, SharedSituTables
+from .front_tp8 import MoeFrontTP8, MoeSharedTP8
 from .front_tp16 import MoeFrontTP16, initialize_designated
 
 # Kernel class and trailing scalar arguments of each small-batch launch.
@@ -31,7 +32,6 @@ _KERNELS = {
     "experts_tp16": (ClusterExpertsTP16, (Float32,) * 3),
     "experts_tp8": (ClusterExpertsTP8, (Float32,) * 3),
     "shared": (MoeSharedTP8, (Int32,) * 2),
-    "tables": (SharedSituTables, (Float32,) * 2),
 }
 
 
@@ -71,10 +71,13 @@ class SmallBatchBox:
         self.ids = armed((16,), -1, torch.int32)
         self.w, self.s = armed((3, POLL_CAP, 16), -1), armed((3, POLL_CAP, 7168), -1)
         self.g = armed((3, POLL_CAP * 16, 3584), -1)
-        self.h2 = OprojMailbox(group, device, tp, rank, (2, POLL_CAP, 3584))
-        self.latent = zeros(3584, dtype=torch.bfloat16)
-        self.hg, self.counter = zeros(6144), zeros(1)
-        self.tables = {}
+        # The routed latent is FP32 at every TP, as stock feeds its MXFP8 quantizer the FP32 front output: an h2 row
+        # holds 3584 FP32 words in 7168 BF16 slots, which TP16's experts read in place.
+        self.h2 = OprojMailbox(group, device, tp, rank, (2, POLL_CAP, 7168))
+        self.latent = zeros(3584, dtype=torch.float32)
+        self.hg = armed((6144,), -0x80000000, torch.int32) if tp == 8 else zeros(6144)
+        self.counter = zeros(1)
+        self.situ_params = {}
         self.batches = (1,) if tp == 8 else (1, 2)
         if tp == 16:  # resident-SM placement mask plus per-batch route/gate scratch
             self.designated = zeros(self.sms + 16)
@@ -82,18 +85,19 @@ class SmallBatchBox:
             self.scratch, i32 = {}, torch.int32
             for b in self.batches:
                 scores = armed((2 * b * 896 * 2,), -0x80000000, i32)
-                self.scratch[b] = scores, armed((b * 16,), -1, i32), zeros(2 * b * 768)
+                # Shared gate/up: FP32 words armed with the 0x80000000 sentinel, as TP8's ``hg`` (A4).
+                hg = armed((2 * b * 768,), -0x80000000, i32)
+                self.scratch[b] = scores, armed((b * 16,), -1, i32), hg
         self.front_views = tuple(self.xmoe[p] for p in range(2))
         self.hint_views = tuple(self.epoch[p * 32 : p * 32 + 224] for p in range(2))
 
-    def situ_tables(self, beta, linear_beta):
+    def situ_parameters(self, beta, linear_beta):
         key = float(beta), float(linear_beta)
-        if key not in self.tables:
-            table = torch.empty(131072, dtype=torch.float32, device=self.device)
-            code, args = _launch("tables", (table,))
-            code(*args, Float32(beta), Float32(linear_beta), stream(self.device))
-            self.tables[key] = table
-        return self.tables[key]
+        if key not in self.situ_params:
+            # FP32 GEMM outputs have no finite BF16 lookup-table representation.
+            table = torch.tensor(key, dtype=torch.float32, device=self.device)
+            self.situ_params[key] = table
+        return self.situ_params[key]
 
 
 class SmallBatchChain:
@@ -119,6 +123,8 @@ class SmallBatchChain:
             tail.tail_box,
         )
         self.prefetch, self.layer_idx = prefetch, layer_idx
+        # the tail box's rows (passed only when not CAP: default cache keys stay)
+        grown = dict(cap=tail.tail_box.cap) if tail.tail_box.cap != CAP else {}
         self.parity, self.slot = layer_idx % 2, int(tail.tail_weights.parity)
         self.batches, shared = box.batches, moe.shared_experts
         router, bias = moe.gate.weight, moe.gate.e_score_correction_bias
@@ -139,8 +145,8 @@ class SmallBatchChain:
                 renorm=renorm,
                 deadline_ns=deadline_ns,
             )
-            tables = box.situ_tables(beta, linear_beta)
-            tensors = (box.xmoe, shared_down, tables, u32(box.hg), box.s)
+            params = box.situ_parameters(beta, linear_beta)
+            tensors = (box.xmoe, shared_down, params, u32(box.hg), box.s)
             self.shared = _launch("shared", tensors, grid=box.sms - 96)
             tensors = (box.latent, box.ids, experts.maps[256:640].view(3, 128), *scales)
             routed, args = _launch(
@@ -154,6 +160,7 @@ class SmallBatchChain:
                 "front_poll",
                 3,
                 deadline_ns=deadline_ns,
+                **grown,
             )
             return
         maps, self.codes = experts.maps[:256].view(2, 128), {}
@@ -161,11 +168,13 @@ class SmallBatchChain:
             scores, ids, hg = box.scratch[b]
             tensors = head + (u32(scores), ids, box.w, down, box.h2.buffer, gate_up)
             tensors += (u32(hg), shared_down, box.s, box.designated)
-            front = _launch("front16", tensors, b, grid=box.sms - 7 * b, renorm=renorm)
-            latent = box.h2.buffer[self.parity, :b].reshape(-1)
+            # B2 role bitmask: 5 words = 160 CTAs (front_tp16.py Placement); a larger part would launch more.
+            grid = box.sms - 7 * b if b == 1 else min(box.sms - 7 * b, 160)
+            front = _launch("front16", tensors, b, grid=grid, renorm=renorm)
+            latent = box.h2.buffer[self.parity, :b].view(torch.float32).reshape(-1)
             g = box.g[self.slot, : b * 16]
             routed = _launch("experts_tp16", (latent, ids, maps, *scales, g), b)
-            tail = compile_tail(16, b, box.device.index, "front_poll", 2)
+            tail = compile_tail(16, b, box.device.index, "front_poll", 2, **grown)
             self.codes[b] = front, routed, tail
         lb = linear_beta
         self.scalars += (Float32(beta), Float32(1 / beta), Float32(lb), Float64(1 / lb))

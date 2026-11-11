@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """TP16 B1/B2 MoE front: SM placement, early router/latent-down staging, MMA router
-and shared gate/up, FP32 routing, latent multicast/gather and shared SiTU/down rows."""
+and shared gate/up, FP32 routing, latent multicast/gather and shared SiTU/down rows.
+
+The latent shard and the shared gate/up leave as FP32 words (-0 made +0, so none is
+the 0x80000000 sentinel), as at TP8 and in stock's FP32 front: the routed experts
+quantize the FP32 latent to MXFP8 and SiTU reads FP32 gate/up."""
 
 import functools
 
@@ -13,10 +18,11 @@ from cutlass import BFloat16, Float32, Int32, Uint8, Uint32, Uint64
 from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 
 from ...common.host import to_cute
+from ...common.mailbox import rearm_fence
 from ...common.primitives import (
     alloc,
     asm,
-    bf16,
+    bits_float,
     copy_bulk,
     div_rn,
     early_weights,
@@ -43,6 +49,7 @@ from ...common.primitives import (
     warp_sum,
     zeros,
 )
+from ...gemm.ws_gemm import positive_zero32
 from ..routing import Top16Fast, bf16_word, gather_x, score_record, stage_rows
 
 
@@ -278,14 +285,13 @@ class MoeFrontTP16:
             total = Float32(0)
             for w in cutlass.range_constexpr(16):
                 total += partials[(w * 16 + row) * self.batch + token]
-            bits = Uint32(gate_bf16_bits(total))
             pointer = hg.iterator + (par * self.batch + token) * 768 + start + row
-            mailbox_store(pointer, ((bits << 16) | Uint32(1),))
+            mailbox_store(pointer, (positive_zero32(total),))
 
     @cute.jit
     def poll_flag(self, pointer):
         word = mailbox_load(pointer)[0]
-        while (word & 1) == 0:
+        while word == Uint32(0x80000000):
             if cutlass.const_expr(self.batch == 2):
                 sleep_ns(128)
             word = mailbox_load(pointer)[0]
@@ -446,13 +452,17 @@ class MoeFrontTP16:
                 offset = tid - 64
                 token, row = offset // max(gate_rows, 1), offset % max(gate_rows, 1)
                 index = ((par ^ 1) * self.batch + token) * 768 + gate_first + row
-                hg[index] = Uint32(0)
+                hg[index] = Uint32(0x80000000)
             vectors: cutlass.Constexpr = xmoe.shape[1] * xmoe.shape[2] * 896
-            rearm = ((xmoe, vectors, vectors), (latent, 3584, self.batch * 448))
+            # h2 parity: POLL_CAP rows of 3584 FP32 latent words = 7168 BF16 slots each.
+            rearm = ((xmoe, vectors, vectors), (latent, 7168, self.batch * 896))
             for tensor, stride, count in rearm:
                 for vector in range(cta * 511 + tid - 1, count, self.grid * 511):
                     pointer = tensor.iterator + (par ^ 1) * stride * 8 + vector * 8
                     mailbox_store(pointer, (Uint32(0x80000000),) * 4)
+            # mc_rf as at the TP8 front's re-arm (front_tp8.py): the multicast latent / x_moe slots re-armed here
+            # are the hazard a stress test reproduced.
+            rearm_fence()
         my_bias = Float32(0)
         if tid < self.batch * router_rows:
             my_bias = bias[router_first + tid % router_rows]
@@ -509,9 +519,12 @@ class MoeFrontTP16:
             for w in cutlass.range_constexpr(16 if self.batch == 1 else 7):
                 lo += latent_partial[w, 2 * lane]
                 hi += latent_partial[w, 2 * lane + 1]
-            word = bf16_word(lo, hi)
-            offset = par * 8 * 3584 + lane * 3584 + rank * 224 + 2 * pair_first
-            multicast_words(multicast_base + Uint64(offset * 2), (word,), kind="b32")
+            # FP32 words (h2 row = 3584 FP32 = 7168 BF16 slots), as front_tp8.py publishes.
+            words = (positive_zero32(lo), positive_zero32(hi))
+            offset = (par * 8 + lane) * 3584 + rank * 224 + 2 * pair_first
+            for i in cutlass.range_constexpr(2):
+                address = multicast_base + Uint64((offset + i) * 4)
+                multicast_words(address, (words[i],), kind="b32")
         if warp == 1:
             cute.arch.sync_warp()
         if tid == 0:
@@ -567,7 +580,7 @@ class MoeFrontTP16:
                 token, column = element // 384, element % 384
                 gp = hg.iterator + (par * self.batch + token) * 768 + column
                 gate, up = self.poll_flag(gp), self.poll_flag(gp + 384)
-                result = shared_situ(bf16(gate, True), bf16(up, True), *situ)
+                result = shared_situ(bits_float(gate), bits_float(up), *situ)
                 hsm[element] = Float32(BFloat16(result))
             cute.arch.sync_threads()
             self.shared_outputs(

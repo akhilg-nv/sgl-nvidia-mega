@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """TP8/B1-B8/B16/B32/B64 captured-decode executor for Kimi K3."""
 
 from __future__ import annotations
@@ -8,11 +9,11 @@ from functools import partial
 from typing import Any
 
 import torch
-from sglang.srt.megakernels.binding import HybridStepView
+from sgl_nvidia_mega.kimi_k3._host import HybridStepView
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
-    "srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "HybridStepView",
         "block_table",
         "kda",
@@ -136,6 +137,11 @@ class KimiK3MegakernelExecutor:
     def __init__(self, resources: Any):
         self.resources = resources
 
+    def before_attention(
+        self, layer_id: int, hidden: torch.Tensor, view: HybridStepView
+    ) -> None:
+        """Model variants can maintain attention side caches before projection."""
+
     def run(
         self,
         input_ids: torch.Tensor,
@@ -193,6 +199,7 @@ class KimiK3MegakernelExecutor:
 
             attention = resources.attention[layer_id]
             projected = mla_projected if attention.kind == "mla" else kda_projected
+            self.before_attention(layer_id, first, view)
             attention.projection.run(first, projected)
             if attention.kind == "mla":
                 attention.core.run(

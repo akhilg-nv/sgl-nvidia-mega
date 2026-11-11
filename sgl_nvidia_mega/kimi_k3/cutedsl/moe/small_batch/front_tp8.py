@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """TP8 B1 small-batch front (full router staged in SMEM, x_moe polling, threshold top16,
 latent multicast and gather, shared gate/up) and the shared-expert finisher."""
 
@@ -7,12 +8,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
+from ...common.mailbox import rearm_fence
 from ...common.primitives import (
     alloc,
-    bf16,
+    bits_float,
+    float_bits,
     copy_bulk,
     copy_g2s,
-    div_rn,
     early_weights,
     fma,
     gate_bf16_bits,
@@ -25,15 +27,10 @@ from ...common.primitives import (
     multicast_words,
     named_barrier,
     published,
-    routing_add,
-    routing_sigmoid,
-    routing_weight,
-    sigmoid,
     smem_words,
     split,
     store_gate_mailbox,
     store_relaxed,
-    table_load,
     thread,
     unpack_bf16,
     view,
@@ -43,7 +40,11 @@ from ...common.primitives import (
     warp_sum,
     zeros,
 )
-from ..routing import Top16Fast, bf16_word, gather_x, score_record, stage_rows
+from ..shared import situ
+from ..routing import Top16Fast, gather_x, score_record, stage_rows
+from ..routing import router_add as routing_add
+from ..routing import router_sigmoid as routing_sigmoid
+from ..routing import router_weight as routing_weight
 
 
 class MoeSharedTP8:
@@ -90,7 +91,7 @@ class MoeSharedTP8:
 
     @cute.kernel
     def kernel(self, args):
-        xmoe, down, tables, hg, output, par, par3 = args[0:7]
+        xmoe, down, params, hg, output, par, par3 = args[0:7]
         tid, warp, lane, cta = thread()
         first = 7168 * cta // self.grid
         end = 7168 * (cta + 1) // self.grid
@@ -128,13 +129,10 @@ class MoeSharedTP8:
             while not valid:
                 gate = mailbox_load(hg.iterator + par * 2 * 1536 + column, count=2)
                 up = mailbox_load(hg.iterator + par * 2 * 1536 + 768 + column, count=2)
-                valid = ((gate[0] & gate[1] & up[0] & up[1]) & Uint32(1)) != 0
-            ga0 = table_load(tables.iterator + (gate[0] >> 16))
-            ua0 = table_load(tables.iterator + 65536 + (up[0] >> 16))
-            ga1 = table_load(tables.iterator + (gate[1] >> 16))
-            ua1 = table_load(tables.iterator + 65536 + (up[1] >> 16))
-            hsm[column] = Float32(BFloat16(ga0 * ua0))
-            hsm[column + 1] = Float32(BFloat16(ga1 * ua1))
+                valid = published(gate) & published(up)
+            beta, linear_beta = params[0], params[1]
+            hsm[column] = Float32(BFloat16(situ(bits_float(gate[0]), bits_float(up[0]), beta, linear_beta)))
+            hsm[column + 1] = Float32(BFloat16(situ(bits_float(gate[1]), bits_float(up[1]), beta, linear_beta)))
         cute.arch.sync_threads()
         out = (hsm, output, par3, lane)
         if lsu_count > 0:
@@ -152,29 +150,6 @@ class MoeSharedTP8:
                 self.rows_out(base, low, low + warp, high, *out)
         if cta == 0:
             cute.arch.griddepcontrol_wait()
-
-
-class SharedSituTables:
-    """Separate FP32 gate/up lookup tables over all BF16 patterns."""
-
-    @cute.jit
-    def __call__(self, *args):
-        launch(self.kernel, args, 256, 256, pdl=False)
-
-    @cute.kernel
-    def kernel(self, args):
-        tables, beta, linear_beta = args[0:3]
-        tid, _, _, cta = thread()
-        index = 256 * cta + tid
-        value = bf16(Uint32(index))
-        gate = div_rn(value, beta)
-        probability = sigmoid(value)
-        tables[index] = (beta * cute.math.tanh(gate, fastmath=False)) * probability
-        up = value
-        if linear_beta > 0:
-            scaled = div_rn(value, linear_beta)
-            up = linear_beta * cute.math.tanh(scaled, fastmath=False)
-        tables[65536 + index] = up
 
 
 class MoeFrontTP8:
@@ -224,9 +199,9 @@ class MoeFrontTP8:
             value = Float32(0)
             for w in cutlass.range_constexpr(16):
                 value += partials[w * 16 + tid]
-            bits = Uint32(gate_bf16_bits(value))
+            bits = Uint32(float_bits(value if value != 0 else Float32(0)))
             pointer = hg.iterator + (par * 2) * 1536 + start + tid
-            mailbox_store(pointer, ((bits << 16) | Uint32(1),))
+            mailbox_store(pointer, (bits,))
         cute.arch.sync_threads()
 
     @cute.kernel
@@ -280,11 +255,12 @@ class MoeFrontTP8:
             if cta > 0:
                 for i in range(tid - 1, 2 * gu_rows, 511):
                     token, row = i // gu_rows, i % gu_rows
-                    hg[(par ^ 1) * 2 * 1536 + token * 1536 + gu_start + row] = Uint32(0)
+                    hg[(par ^ 1) * 2 * 1536 + token * 1536 + gu_start + row] = Uint32(0x80000000)
             slot_vectors: cutlass.Constexpr = xmoe.shape[1] * xmoe.shape[2] * 896
             for i in range(cta * 511 + tid - 1, slot_vectors, self.grid * 511):
                 pointer = xmoe.iterator + (par ^ 1) * slot_vectors * 8 + i * 8
                 mailbox_store(pointer, (Uint32(0x80000000),) * 4)
+            rearm_fence()
         my_bias = Float32(0)
         if tid < router_rows:
             my_bias = bias[first_router + tid]
@@ -309,9 +285,11 @@ class MoeFrontTP8:
                 for w in cutlass.range_constexpr(16):
                     lo += latent_partial[w, 2 * lane]
                     hi += latent_partial[w, 2 * lane + 1]
-                packed = bf16_word(lo, hi)
-                offset = par * 8 * 3584 * 2 + rank * 896 + (first_pair + lane) * 4
-                multicast_words(multicast_base + Uint64(offset), (packed,), kind="b32")
+                words = tuple(Uint32(float_bits(v if v != 0 else Float32(0))) for v in (lo, hi))
+                offset = par * 8 * 3584 * 4 + rank * 1792 + (first_pair + lane) * 8
+                for i in cutlass.range_constexpr(2):
+                    multicast_words(multicast_base + Uint64(offset + 4 * i),
+                                    (words[i],), kind="b32")
         else:
             named_barrier(3, 512, arrive=True)
         if tid == 0:  # noqa: SIM102
@@ -344,7 +322,7 @@ class MoeFrontTP8:
                         store_gate_mailbox(pointer, gate_bf16_bits(value))
                     cute.arch.sync_warp()
                 for vector in range(tid, 448, 256):
-                    pointer = latent.iterator + par * 8 * 3584 + vector * 8
+                    pointer = cute.recast_ptr(latent.iterator, dtype=Float32) + par * 8 * 3584 + vector * 8
                     words = mailbox_load(pointer, count=4, scope="sys")
                     ready = published(words)
                     started, polls = Int64(0), Int32(0)
@@ -354,8 +332,17 @@ class MoeFrontTP8:
                         polls = wait_deadline_check(started, polls, self.deadline_ns)
                         words = mailbox_load(pointer, count=4, scope="sys")
                         ready = published(words)
+                    high = mailbox_load(pointer + 4, count=4, scope="sys")
+                    if not published(high):
+                        started = wait_deadline_start(self.deadline_ns)
+                    while not published(high):
+                        polls = wait_deadline_check(started, polls, self.deadline_ns)
+                        high = mailbox_load(pointer + 4, count=4, scope="sys")
                     mailbox_store(latent_out.iterator + vector * 8, words)
+                    mailbox_store(latent_out.iterator + vector * 8 + 4, high)
                     store_relaxed(pointer, (Uint32(0x80000000),) * 4)
+                    store_relaxed(pointer + 4, (Uint32(0x80000000),) * 4)
+                rearm_fence()
             cute.arch.griddepcontrol_wait()
         else:
             cute.arch.sync_threads()

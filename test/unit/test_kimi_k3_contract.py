@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU contracts for the Kimi K3 NVIDIA megakernel plugin."""
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import torch
 
 WIDTHS = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 FROZEN_PAYLOAD_SHA256 = (
-    "c3fde49433b5a43efd9cd75f68db1ce09d41581506492938a29664255d6327c2"
+    "218c06cfd391719e0ad759109cf47d6e8347a58f42b70e215a3228880a69630b"
 )
 
 
@@ -57,7 +58,7 @@ class TestKimiK3Contract(unittest.TestCase):
         self.assertEqual(REQUIRED_MEGAKERNEL_API_VERSION, 1)
         self.assertEqual(SPEC.api_version, 1)
         self.assertEqual(MEGAKERNEL_API_VERSION, 1)
-        self.assertEqual(SPEC.requires.isas, frozenset({"sm_103"}))
+        self.assertEqual(SPEC.requires.isas, frozenset({"sm_103", "sm_107"}))
         self.assertEqual(SPEC.requires.tp_sizes, frozenset({8}))
         self.assertEqual(SPEC.requires.resident_blocks, 152)
         self.assertEqual(SPEC.requires.dtypes, frozenset({"bfloat16"}))

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Options described as "ported" follow NVIDIA's Rubin (sm_107) specialized-decode kernels (the rubin package).
 """O-projection producer for the split and fused AttnRes paths: 112 CTAs of 64 output
 rows. Each warp keeps ``rows`` 16-row weight tiles of one of ``4 * rows`` K parts in
 registers (TP8 stages some K blocks in shared memory), runs BF16 MMA chains and the K
@@ -14,7 +16,7 @@ the same producer for B>8."""
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Constexpr, Float32, Int64, Uint8, Uint32, Uint64
+from cutlass import Constexpr, Float32, Int32, Int64, Uint8, Uint32, Uint64
 
 from ..common.primitives import (
     add_rn,
@@ -38,10 +40,12 @@ from ..common.primitives import (
     stage_weight,
     store_shared_words,
     thread,
+    unpack_bf16,
     view,
     wait,
 )
-from ..common.twoshot import push
+from ..common.twoshot import push, reduce
+from . import mfx_hhome as HH  # H-HOME forms (default off)
 
 
 def pack8(values, policy="plain"):
@@ -60,16 +64,25 @@ def tree_reduce(values, op):
 
 
 class OprojProducer:
-    def __init__(self, k, *, staged_blocks, rows=1, group_tiles=0, twoshot=False):
+    # K-19 trigger fence (``K31MK_K19_FENCE`` sites oproj_producer / oproj_umma, default off): fence.acq_rel.gpu
+    # right before the trigger that follows griddepcontrol.wait. Set per instance by ``oproj.prepared.producer``.
+    k19_fence = False
+
+    def __init__(
+        self, k, *, staged_blocks, rows=1, group_tiles=0, twoshot=False, x_shared=False
+    ):
         self.k, self.staged, self.rows = k, staged_blocks, rows
         self.twoshot = twoshot
         self.parts = 4 * rows
         self.kblocks = k // (32 * self.parts)
         self.register_blocks = self.kblocks - self.staged
         self.group_tiles = group_tiles
-        # Single pass: TP8 copies the batch to shared memory, TP16 loads registers.
-        self.shared_x = self.staged > 0 and not group_tiles
-        self.register_x = k == 768 and not group_tiles
+        # Single pass: TP8 copies the batch to shared memory, TP16 loads registers or
+        # (``x_shared``) copies it once per CTA instead of once per warp (the source's
+        # Rubin option; same MMA operands, bitwise identical).
+        self.shared_x = (self.staged > 0 or x_shared) and not group_tiles
+        self.register_x = k == 768 and not group_tiles and not x_shared
+        self.x_shared = x_shared and not group_tiles
         self.x_stride = k // 8 + 4
         self.chains = max(1, 4 // (rows * max(1, group_tiles)))
 
@@ -250,11 +263,33 @@ class OprojProducer:
         kofs = warp % self.parts * self.kblocks * 32 + part * 8
         cute.arch.griddepcontrol_wait()
         if cutlass.const_expr(trigger_after_wait):
+            if cutlass.const_expr(self.k19_fence):
+                cute.arch.fence_acq_rel_gpu()
             cute.arch.griddepcontrol_launch_dependents()
         xr = cute.make_rmem_tensor((NT, self.kblocks, 4), Uint32)
         if cutlass.const_expr(self.group_tiles):
             self.stage_x(x, xs, 0, 0)
-        if cutlass.const_expr(self.shared_x):
+        if cutlass.const_expr(self.x_shared):
+            # Every chunk's load in flight before the first shared store (ported form).
+            chunks: Constexpr = M * (self.k // 8)
+            rounds: Constexpr = (chunks + 511) // 512
+            held = cute.make_rmem_tensor((rounds, 4), Uint32)
+            for i in cutlass.range_constexpr(rounds):
+                chunk = tid + i * 512
+                if chunk < chunks:
+                    token, col = chunk // (self.k // 8), chunk % (self.k // 8)
+                    words = load_vector(at(x, token, col * 8))
+                    for v in cutlass.range_constexpr(4):
+                        held[i, v] = words[v]
+            for i in cutlass.range_constexpr(rounds):
+                chunk = tid + i * 512
+                if chunk < chunks:
+                    token, col = chunk // (self.k // 8), chunk % (self.k // 8)
+                    words = tuple(held[i, v] for v in range(4))
+                    dst = xs.iterator + (token * self.x_stride + col) * 4
+                    store_shared_words(dst, words)
+            cute.arch.sync_threads()
+        elif cutlass.const_expr(self.shared_x):
             for chunk in range(tid, M * (self.k // 8), 512):
                 token, col = chunk // (self.k // 8), chunk % (self.k // 8)
                 words = load_vector(at(x, token, col * 8))
@@ -308,9 +343,49 @@ class OprojUmma(OprojProducer):
     warp accumulates D [64, N] FP32 in TMEM with M=64 kind::f16 MMAs, and the loader
     warps round D to BF16 and publish it like ``OprojProducer``."""
 
-    def __init__(self, k, *, twoshot=False, budget=184 * 1024):
+    # PRW (``K31MK_OPROJ_PRW``, default off; set per instance by ``oproj.prepared.producer`` at the batches
+    # of its table): ``reduce_owned`` runs its owner rounds j = 0 .. rounds - 1 on the loader warps j at once instead of one
+    # after another on warp 0. Rounds > 1 only above 64 rows (B x 56 chunks > 112 CTAs x 32 lanes: the verify rows 96-128
+    # under K31MK_OPROJ_PRODUCER_REDUCE), where round 2 waited for round 1's polls, sums, multicasts, re-arms and fence. Each
+    # chunk keeps its CTA and lane and its one ``twoshot.reduce`` call (poll, FP32 sum in rank order, multicast, re-arm by
+    # the thread that polled, fence): bitwise identical, no new synchronization edge; rows <= 64 compile unchanged.
+    prw = False
+    # HH-G (``K31MK_OPROJ_HHOME_G``, default off; set per instance by ``oproj.prepared.compile_oproj``):
+    # the owner's gather (args[5]) is re-laid out by ``mfx_hhome.homed`` (rule bit k) before its multicast; -1 = served layout.
+    hhome = -1
+    # HH-R (``K31MK_OPROJ_HHOME_R``, default off; set by ``oproj.prepared.compile_oproj``): 1 = the pushes use
+    # the homed receive layout (``mfx_hhome.homed_recv``); 2 = also the die-matched owner reduce (one ticket per CTA; args[-2] =
+    # ticket word, args[-1] = SM -> locality domain table). 0 = served code.
+    hhome_r = 0
+    # HH-M (``K31MK_OPROJ_HHOME_M``, default off; set by ``oproj.prepared.compile_oproj``): this one-shot
+    # producer multicasts into the homed one-shot mailbox layout (``mfx_hhome.homed_mailbox``). False = served code.
+    hhome_m = False
+
+    def __init__(
+        self, k, *, twoshot=False, budget=184 * 1024, reduce=False, resident=False, residual=False,
+        deadline_ns=0,
+    ):  # fmt: skip
+        # Package (b) (the ported ``OprojUmma`` RESIDENT_RING / PRODUCER_REDUCE;
+        # knobs in ``prepared.opr_options``; same MMAs and sums, bitwise identical; default off):
+        # ``resident``: every K block gets its own ring stage (12 x 16 KB at k 768, b <= 64), so
+        # all weights load before the PDL wait and x streams with no stage reuse.
+        budget = 12 * (8192 + 64 * 128) if resident else budget
         super().__init__(k, staged_blocks=0, twoshot=twoshot)
         self.blocks, self.budget = k // 64, budget
+        # ``reduce`` (two-shot): after its pushes each CTA's warp 0 also owner-reduces 32
+        # chunks of this rank's columns (``common.twoshot.reduce``: the TP slots in rank
+        # order, multicast to the gather, slots re-armed); args (gather, gather multicast)
+        # after the push tail. Its 112 CTAs are resident from the start (the PDL dependents
+        # launch only once every CTA has triggered), so the reduction starts when the last
+        # slot lands instead of when a late consumer CTA is placed; the consumer then only
+        # polls the gather (``OprojConsumer(reduced=True)``). ``residual`` (our
+        # K31MK_OPROJ_SINGLE_ROUND with a prefix): a trailing prefix [B, 7168] argument whose
+        # chunk the owner adds to its FP32 sum before its one rounding, as the consumer's
+        # owner does (consumer.py ``reduce(..., old)``). ``deadline_ns``: the build deadline
+        # of the owner's poll (as the consumer's).
+        self.reduce, self.residual, self.deadline_ns = reduce, residual, deadline_ns
+        if (reduce or residual) and not twoshot or residual and not reduce:
+            raise ValueError("OprojUmma: reduce needs twoshot; residual needs reduce")
 
     def geometry(self, batches):
         """(N, ring stage bytes, stages, TMEM columns)."""
@@ -362,6 +437,10 @@ class OprojUmma(OprojProducer):
         """D rows 16 * warp + lane (lane < 16: M=64 TMEM layout) -> FP32 [token, row]
         tile in the drained ring -> 8-row BF16 chunks to the mailbox / partials."""
         x, _, mailbox, mc, slot = args[:5]
+        if cutlass.const_expr(self.hhome_r > 0):  # HH-R: push into the homed receive layout
+            mailbox = HH.homed_recv(mailbox)
+        if cutlass.const_expr(self.hhome_m):  # HH-M: push into the homed one-shot mailbox layout
+            mailbox = HH.homed_mailbox(mailbox)
         M: Constexpr = x.shape[0]
         tid, warp, lane, _ = thread()
         values = load_tmem(tmem + (32 * warp << 16), self.geometry(M)[3])
@@ -414,6 +493,10 @@ class OprojUmma(OprojProducer):
         fence_tmem()
         tmem = tmem_slot[0]
         row0 = cta * 64
+        hh_d, hh_old = Int32(0), Uint64(0)  # HH-R: this SM's die (static table, read before the wait), the ticket result
+        if cutlass.const_expr(self.hhome_r == 2):
+            if tid == 0:
+                hh_d = HH.die_of_sm(args[-1])
         if warp < 4:  # weights do not depend on the previous kernel
             if cutlass.const_expr(stages < self.blocks) and tid < 64:
                 rest = at(weight, row0 + tid, stages * 64)
@@ -422,6 +505,8 @@ class OprojUmma(OprojProducer):
                 self.load(weight, ring.iterator + s * stage, 64, -1, row0, s * 64)
                 cute.arch.cp_async_mbarrier_arrive_noinc(bars.iterator + s)
         cute.arch.griddepcontrol_wait()
+        if cutlass.const_expr(self.k19_fence):
+            cute.arch.fence_acq_rel_gpu()
         cute.arch.griddepcontrol_launch_dependents()
         if warp < 4:
             for kb in cutlass.range_constexpr(self.blocks):
@@ -433,11 +518,102 @@ class OprojUmma(OprojProducer):
                     cute.arch.cp_async_mbarrier_arrive_noinc(bars.iterator + slot)
                 self.load(x, tile + 8192, n, x.shape[0], 0, kb * 64)
                 cute.arch.cp_async_mbarrier_arrive_noinc(bars.iterator + slot)
+            if cutlass.const_expr(self.hhome_r == 2):  # HH-R: one ticket per CTA, its latency under the MMA tail
+                if tid == 0:
+                    hh_old = HH._ticket(args[-2].iterator.toint(), Uint64(1) << Uint64(32 * hh_d))
             wait(bars.iterator + 2 * stages, 0)
             fence_tmem()
             # The MMAs (async proxy) read the ring the epilogue now overwrites.
             cute.arch.fence_proxy("async.shared", space="cta")
             self.epilogue(args, ring, tmem, cta, n)
+            if cutlass.const_expr(self.reduce and self.hhome_r == 2):
+                self.reduce_owned_homed(args, tid, hh_old, hh_d)
+            elif cutlass.const_expr(self.reduce):
+                self.reduce_owned(args, cta, tid)
         else:
             self.multiply(ring, bars, tmem, n, stage)
         release_tmem(tmem, columns, warp, 4)
+
+    @cute.jit
+    def reduce_owned(self, args, cta, tid):
+        """Warp 0: chunks 32 cta + lane (+ 112 x 32 per round) of this rank's owned
+        [tokens, W] columns (the ported ``reduce_owned``, plus the residual and the
+        build deadline)."""
+        x, _, recv, _, rank, gather, gather_mc = args[:7]
+        if cutlass.const_expr(self.hhome >= 0):  # HH-G
+            gather = HH.homed(gather, self.hhome)
+        per: Constexpr = recv.shape[2] // 8  # 8-column chunks per token
+        # above 112 x 32 / per tokens the lanes take more than one item each
+        rounds: Constexpr = -(-x.shape[0] * per // (112 * 32))
+        if cutlass.const_expr(self.prw and 1 < rounds <= 4):  # PRW: round j on loader warp j, all at once
+            for j in cutlass.range_constexpr(rounds):
+                if tid // 32 == j:
+                    self.reduce_chunk(args, cta * 32 + tid % 32 + 112 * 32 * j, per)
+        elif tid < 32:
+            for j in cutlass.range_constexpr(rounds):
+                g = cta * 32 + tid + 112 * 32 * j
+                if g < x.shape[0] * per:
+                    token, local = g // per, g % per
+                    column = rank * recv.shape[2] + local * 8
+                    if cutlass.const_expr(self.residual):
+                        words = load_vector(at(args[7], token, column))
+                        old = cute.make_rmem_tensor(8, Float32)
+                        for v in cutlass.range_constexpr(4):
+                            old[2 * v], old[2 * v + 1] = unpack_bf16(words[v])
+                        reduce(recv, gather, gather_mc, rank, token, column, self.deadline_ns, old, True)
+                    else:
+                        reduce(recv, gather, gather_mc, rank, token, column, self.deadline_ns, None, True)
+
+    @cute.jit
+    def reduce_owned_homed(self, args, tid, hh_old, hh_d):
+        """HH-R: warp 0 owner-reduces the R-block unit its ticket assigned (``mfx_hhome.owner_code``): items i = 32 block + lane of
+        segment s's list (token 2 (i // per) + s, chunk i % per), R = the served rounds; same ``twoshot.reduce`` per item."""
+        x, _, recv, _, rank, gather, gather_mc = args[:7]
+        if cutlass.const_expr(self.hhome >= 0):  # HH-G
+            gather = HH.homed(gather, self.hhome)
+        recv = HH.homed_recv(recv)
+        per: Constexpr = recv.shape[2] // 8
+        rounds: Constexpr = -(-x.shape[0] * per // (112 * 32))
+        geo: Constexpr = HH.owner_geometry(x.shape[0], per, rounds)
+        if tid < 32:
+            code = Int32(-1)
+            if tid == 0:
+                code = HH.owner_code(args[-2], hh_old, hh_d, geo[3][0], geo[3][1])
+            code = cute.arch.shuffle_sync(code, 0)
+            if code >= 0:
+                s = code >> 16
+                unit = code & 0xFFFF
+                items = Int32(geo[1][0])
+                if s == 1:
+                    items = Int32(geo[1][1])
+                for j in cutlass.range_constexpr(rounds):
+                    i = (unit * rounds + j) * 32 + tid
+                    if i < items:
+                        token = HH.owner_token(i, per, s)
+                        column = rank * recv.shape[2] + (i % per) * 8
+                        if cutlass.const_expr(self.residual):
+                            words = load_vector(at(args[7], token, column))
+                            old = cute.make_rmem_tensor(8, Float32)
+                            for v in cutlass.range_constexpr(4):
+                                old[2 * v], old[2 * v + 1] = unpack_bf16(words[v])
+                            reduce(recv, gather, gather_mc, rank, token, column, self.deadline_ns, old, True)
+                        else:
+                            reduce(recv, gather, gather_mc, rank, token, column, self.deadline_ns, None, True)
+
+    @cute.jit
+    def reduce_chunk(self, args, g, per: Constexpr):
+        """PRW: ``reduce_owned``'s item ``g`` (the served loop body, verbatim)."""
+        x, _, recv, _, rank, gather, gather_mc = args[:7]
+        if cutlass.const_expr(self.hhome >= 0):  # HH-G
+            gather = HH.homed(gather, self.hhome)
+        if g < x.shape[0] * per:
+            token, local = g // per, g % per
+            column = rank * recv.shape[2] + local * 8
+            if cutlass.const_expr(self.residual):
+                words = load_vector(at(args[7], token, column))
+                old = cute.make_rmem_tensor(8, Float32)
+                for v in cutlass.range_constexpr(4):
+                    old[2 * v], old[2 * v + 1] = unpack_bf16(words[v])
+                reduce(recv, gather, gather_mc, rank, token, column, self.deadline_ns, old, True)
+            else:
+                reduce(recv, gather, gather_mc, rank, token, column, self.deadline_ns, None, True)

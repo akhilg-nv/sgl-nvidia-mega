@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Cache-independent Kimi K3 megakernel resources and runtime-pool binding.
 
 SGLang's megakernel framework imports this module only after configuration and
@@ -24,24 +25,50 @@ import torch
 from sglang.srt.distributed.communication_op import (
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.megakernels.binding import HybridPoolView
+from sgl_nvidia_mega.kimi_k3._host import HybridPoolView
 from sglang.srt.runtime_context import get_parallel
 
 from .projection_storage import (
     coalesce_kda_projection_storage,
     coalesce_mla_projection_storage,
 )
+from .shapes import enabled_tp_sizes, kda_pitch
+from .shapes import heads as tp_heads
+from .shapes import mla_pitch as k3_mla_pitch
 
 PAYLOAD_PACKAGE = "sgl_nvidia_mega.kimi_k3.cutedsl"
 _BATCHES = (1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 64)
 _MAX_BATCH = max(_BATCHES)
+
+
+def _batch_scratch(device, heads, mla_pitch, kda_width, batches):
+    """Row-wise scratch shared by every batch of one boot. It holds _MAX_BATCH rows, or the largest requested
+    batch when a caller asks for more (verify at Breq 16 = 128 rows), so no kernel writes past its rows."""
+    rows = max(_MAX_BATCH, *batches)
+
+    def bf16(*shape):
+        return torch.empty((rows, *shape), dtype=torch.bfloat16, device=device)
+
+    return {
+        # PreparedMla.prepare_cache performs one bounded warm call.  Zero is a
+        # finite FP8 encoding, unlike arbitrary uninitialized byte patterns.
+        "mla.query": torch.zeros((rows, heads, 576), dtype=torch.uint8, device=device),
+        "mla.projected": bf16(mla_pitch),
+        "kda.projected": bf16(kda_width),
+        "attention.local": bf16(heads * 128),
+        "hidden.0": bf16(7168),
+        "hidden.1": bf16(7168),
+        "hidden.out": bf16(7168),
+        "prefix": bf16(7168),
+        "blocks": bf16(8, 7168),
+    }
 
 # Names read from SGLang internals. A contract test checks these before GPU use.
 SGLANG_READS = {
     "srt/distributed/communication_op.py": ("tensor_model_parallel_all_reduce",),
     "srt/distributed/parallel_state.py": ("device_group",),
     "srt/arg_groups/fields/parallel.py": ("tp_group", "tp_rank", "tp_size"),
-    "srt/megakernels/binding.py": (
+    "srt/kernel_plugins/nvidia/binding.py|srt/megakernels/binding.py": (
         "HybridPoolView",
         "cache",
         "capacity",
@@ -308,7 +335,8 @@ def _final_proxy(backbone: Any) -> Any:
 
 def _mla_proxy(attention: Any) -> tuple[Any, tuple[torch.Tensor, ...]]:
     source_w_uk = attention.w_kc
-    if source_w_uk.shape != (12, 128, 512):
+    heads = int(source_w_uk.shape[0])
+    if heads not in (6, 12) or source_w_uk.shape != (heads, 128, 512):
         raise ValueError(f"unsupported MLA W_UK_T shape: {source_w_uk.shape}")
     if source_w_uk.stride() != (65536, 1, 128):
         raise ValueError(
@@ -321,7 +349,7 @@ def _mla_proxy(attention: Any) -> tuple[Any, tuple[torch.Tensor, ...]]:
         raise ValueError("MLA kernel W_UK_T is not 16-byte aligned")
     if not torch.equal(kernel_w_uk, source_w_uk):
         raise ValueError("MLA W_UK_T layout normalization changed values")
-    if attention.w_vc.shape != (12, 512, 128):
+    if attention.w_vc.shape != (heads, 512, 128):
         raise ValueError(f"unsupported MLA W_UV shape: {attention.w_vc.shape}")
     if attention.w_vc.stride() != (65536, 1, 512):
         raise ValueError(f"unsupported MLA W_UV stride: {attention.w_vc.stride()}")
@@ -386,8 +414,10 @@ def _prepare_mla_workspace(
         return module._FLASHINFER[key]
     from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
+    from sgl_nvidia_mega.kimi_k3.compat import TRTLLM_KV_COUNTER_ROWS
+
     sms = torch.cuda.get_device_properties(device).multi_processor_count
-    count = get_trtllm_gen_multi_ctas_kv_counter_bytes(64, heads, sms)
+    count = get_trtllm_gen_multi_ctas_kv_counter_bytes(TRTLLM_KV_COUNTER_ROWS, heads, sms)
     workspace = torch.zeros(128 << 20, dtype=torch.int8, device=device)
     counter = torch.zeros(count, dtype=torch.uint8, device=device)
     module._FLASHINFER[key] = workspace, counter
@@ -426,6 +456,7 @@ class ResourceSet:
     memory_after: dict[str, int]
     deadline_ns: int
     resource_inventory: list[dict[str, Any]] = field(default_factory=list)
+    heads: int = 12  # local MLA/KDA heads (TP8 12, TP16 6)
     resource_digest: str = ""
     binding: dict[str, Any] | None = None
     binding_fingerprint: str | None = None
@@ -512,8 +543,9 @@ class ResourceSet:
             page_size,
             576,
         )
-        expected_conv_shape = (kda_capacity + 1, 3, 4608)
-        expected_temporal_shape = (kda_capacity + 1, 12, 128, 128)
+        heads, dim = self.heads, self.heads * 128
+        expected_conv_shape = (kda_capacity + 1, 3, 3 * dim)
+        expected_temporal_shape = (kda_capacity + 1, heads, 128, 128)
 
         local_identities: dict[str, int] = {}
         local_layouts: list[dict[str, Any]] = []
@@ -550,15 +582,17 @@ class ResourceSet:
                 conv_view,
                 dtype=torch.bfloat16,
                 shape=expected_conv_shape,
-                stride=(3 * 4608, 4608, 1),
+                stride=(3 * 3 * dim, 3 * dim, 1),
                 device=device,
             )
+            # FP32 = default; BF16 = an optional lossy setting (--mamba-ssm-dtype bfloat16)
+            temporal_dtype = torch.bfloat16 if temporal_view.dtype == torch.bfloat16 else torch.float32
             _validate_pool_tensor(
                 f"layer {layer_id} KDA temporal state",
                 temporal_view,
-                dtype=torch.float32,
+                dtype=temporal_dtype,
                 shape=expected_temporal_shape,
-                stride=(12 * 128 * 128, 128 * 128, 128, 1),
+                stride=(heads * 128 * 128, 128 * 128, 128, 1),
                 device=device,
             )
             local_identities[f"kda_conv.{layer_id}"] = int(conv_view.data_ptr())
@@ -641,28 +675,53 @@ def build_resources(
     context_length: int,
     memory_before: dict[str, int],
     deadline_ns: int,
+    query_widths: tuple[int, ...] = (1,),
+    packed_projection_weights: tuple[torch.Tensor, ...] | None = None,
+    batches: tuple[int, ...] | None = None,
+    mla_pitch: int | None = None,
+    mla_storage: Any = coalesce_mla_projection_storage,
+    mla_factory: Any = None,
+    qf_g18: bool = False,
 ) -> ResourceSet:
-    """Build every frozen TP8/B1-B8/B16/B32/B64 provider after all-rank consensus."""
+    """Build every frozen TP8/B1-B8/B16/B32/B64 provider after all-rank consensus. ``qf_g18``: the K3.1 QF verify build
+    under K31MK_DSA_QF_G18 (mla/head_gate.py); every other build refuses the knob."""
 
+    batches = _BATCHES if batches is None else tuple(batches)
     memory_before = dict(memory_before)
     origins: dict[str, str] = {}
     projection_module = _module("gemm.projection", origins)
     mla_module = _module("mla.prepared", origins)
+    head_gate_module = _module("mla.head_gate", origins)
+    if bool(qf_g18) != head_gate_module.G18:
+        raise ValueError(
+            "K31MK_DSA_QF_G18=1 serves only the K3.1 TARGET_VERIFY build with K31MK_DSA_QF=1 (its gate readers would read "
+            "column 2272 of a weight this build does not reorder)"
+            if head_gate_module.G18 else "qf_g18 needs K31MK_DSA_QF_G18=1"
+        )
     kda_module = _module("kda.prepared", origins)
+    kda_verify_module = _module("kda.verify", origins)  # fix A coupling
     attnres_module = _module("attn_res.prepared", origins)
     oproj_module = _module("oproj.prepared", origins)
     twoshot_module = _module("common.twoshot", origins)
     dense_module = _module("moe.dense", origins)
     experts_module = _module("moe.experts_runtime", origins)
+    planned_module = _module("moe.planned", origins)  # opt-in K31MK_EXPERTS_PLANNED
+    w4a4_module = _module("mkv2.experts_w4a4", origins)  # opt-in K31MK_EXPERTS_W4A4 (lossy, TP16 B<=8)
     front_module = _module("moe.front", origins)
     prepared_moe_module = _module("moe.prepared", origins)
     chain_module = _module("moe.small_batch.chain", origins)
     tail_module = _module("moe.tail_runtime", origins)
+    route_tap_module = _module("moe.route_tap", origins)  # opt-in K31MK_MOE_ROUTE_TAP (census, never timed)
 
     parallel = get_parallel()
     tp, rank = int(parallel.tp_size), int(parallel.tp_rank)
-    if tp != 8:
-        raise ValueError(f"Kimi K3 megakernel initial resources require TP8, got {tp}")
+    if tp not in enabled_tp_sizes():
+        raise ValueError(
+            f"Kimi K3 megakernel resources serve TP{sorted(enabled_tp_sizes())}, got TP{tp}"
+            " (TP16 needs K31MK_TP16=1)"
+        )
+    heads, kda_width = tp_heads(tp), kda_pitch(tp)
+    mla_pitch = k3_mla_pitch(tp) if mla_pitch is None else mla_pitch
     group = parallel.tp_group.device_group
     device = next(model.parameters()).device
     owner = (group, device, tp, rank)
@@ -690,11 +749,55 @@ def build_resources(
             "Kimi layer modules disagree with the configured attention split"
         )
 
-    mailbox = oproj_module.OprojMailbox(*owner)
-    oproj_twoshot = twoshot_module.TwoShot(*owner)
-    front_box = oproj_module.OprojMailbox(*owner, (1, 64, 3584 + 2 * 896))
-    small_box = chain_module.SmallBatchBox(*owner)
-    tail_box = tail_module.MoeTailBox(*owner)
+    # O-projection mailbox and two-shot rows follow the largest batch (64-row boots unchanged).
+    oproj_cap = oproj_module.capacity(batches)
+    mailbox = oproj_module.OprojMailbox(*owner, (2, tp, oproj_cap, 7168))
+    # H-HOME (K31MK_OPROJ_HHOME_G / K31MK_OPROJ_HHOME_R, default unset): the two-shot gather rows and / or
+    # owner receive slots in two localized segments (one per locality domain); PreparedOproj reads the rule from the object.
+    # Both knobs unset = the served TwoShot and oproj.mfx_hhome is not imported (trees without it build as before).
+    # Engagement (BOOTCHECKS): one stderr line 'K31MK_OPROJ_HHOME engaged ...' per process with each segment's locality domain attribute and
+    # the SM -> locality domain table counts; knobs set without this line = not engaged (e.g. this hunk missing).
+    import os  # noqa: PLC0415 - H-HOME knob check only
+    hhome_module = None
+    if os.environ.get("K31MK_OPROJ_HHOME_G") or os.environ.get("K31MK_OPROJ_HHOME_R"):
+        hhome_module = _module("oproj.mfx_hhome", origins)
+    if hhome_module is not None and (hhome_module.gather_rule() is not None or hhome_module.recv_rule()):
+        oproj_twoshot = hhome_module.HomedTwoShot(*owner, cap=oproj_cap)
+        ts, facts = oproj_twoshot, ""
+        try:
+            loc = importlib.import_module(hhome_module.__package__ + ".mfx_localized")
+            segs = []
+            for name, box in (("gather", getattr(ts, "box", None)), ("recv", getattr(ts, "rbox", None))):
+                if box is not None:
+                    lds = (loc.pointer_ld(box.local_ptr + i * hhome_module.SEG_ELEMS * 2) for i in range(2))
+                    segs.append(f"{name}:{box.kind}:" + "/".join(map(str, lds)))
+            facts = f"segments_ld={','.join(segs) or '-'} sm_table={int(getattr(ts, 'smtab', None) is not None)}"
+        except Exception as e:  # noqa: BLE001 - the line must never stop a boot
+            facts = f"facts_error={e!r}"
+        print(f"K31MK_OPROJ_HHOME engaged gather={getattr(ts, 'rule', None)} recv={int(bool(getattr(ts, 'recv_dynamic', False)))} "
+              f"cap={oproj_cap} {facts} pid={os.getpid()}", file=__import__("sys").stderr, flush=True)
+    else:
+        oproj_twoshot = twoshot_module.TwoShot(*owner, cap=oproj_cap)
+    # [FP32 latent 3584 | FP32 logits 896] per token at every TP (stock's FP32 front).
+    front_width = 2 * 3584 + 2 * 896
+    # DRR (K31MK_MOE_ROUTE_DEFER_REARM; default unset = one parity, today's box): the routing kernel of
+    # MoE ordinal k re-arms ordinal k-1's cells at its entry, so consecutive MoE ordinals use the two parities of one box.
+    front_drr = bool(
+        getattr(front_module, "route_defer_batches", lambda _: set())(tp) & {b for b in batches if b > 8}
+    )
+    # one row per token (64-row boots unchanged); DRR: two parities
+    front_box = oproj_module.OprojMailbox(*owner, (2 if front_drr else 1, oproj_cap, front_width))
+    # CDR (K31MK_OPROJ_DEFER_REARM; default unset = no cdr_last argument,
+    # today's build): the split consumer of o-proj layer L re-arms layer L-1's slots (other parity) at its entry; the last o-proj
+    # layer of this rank also re-arms its own, so every slot is armed at the forward boundary.
+    oproj_cdr = bool(getattr(oproj_module, "oproj_defer_batches", lambda _: set())(tp) & set(batches))
+    last_oproj = int(layers[-1].layer_idx)
+    if oproj_cdr:  # g2 CDR-C1: CDR's parity offsets assume this rank's o-proj layers run in order with consecutive layer_idx
+        ids = [int(layer.layer_idx) for layer in layers]
+        if ids != list(range(ids[0], ids[0] + len(ids))):
+            raise ValueError(f"K31MK_OPROJ_DEFER_REARM: o-proj layer ids must be consecutive (parity alternation), got {ids}")
+    small_box = chain_module.SmallBatchBox(*owner) if max(query_widths) == 1 else None
+    tail_box = tail_module.MoeTailBox(*owner, cap=oproj_cap)  # same rows as the o_proj mailbox
     boxes = {
         "oproj": mailbox,
         "oproj_twoshot": oproj_twoshot,
@@ -702,39 +805,15 @@ def build_resources(
         "small_batch": small_box,
         "moe_tail": tail_box,
     }
-    moe_state = prepared_moe_module.MoEScratch(tp, device, _BATCHES)
+    moe_state = prepared_moe_module.MoEScratch(tp, device, batches)
     # Materialize the state-owned event handles before resource inventory.  The
     # prepared MoE records them again at each execution boundary, so completing
     # an initialization record on its own stream does not alter runtime order.
-    for event in (moe_state.begin, moe_state.shared_done, moe_state.gate_done):
+    for event in (moe_state.begin, moe_state.shared_done, moe_state.gate_done, moe_state.front_done):
         event.record(moe_state.stream)
     moe_state.stream.synchronize()
     scratch = {
-        # PreparedMla.prepare_cache performs one bounded warm call.  Zero is a
-        # finite FP8 encoding, unlike arbitrary uninitialized byte patterns.
-        "mla.query": torch.zeros((64, 12, 576), dtype=torch.uint8, device=device),
-        "mla.projected": torch.empty(
-            (_MAX_BATCH, 3648), dtype=torch.bfloat16, device=device
-        ),
-        "kda.projected": torch.empty(
-            (_MAX_BATCH, 6288), dtype=torch.bfloat16, device=device
-        ),
-        "attention.local": torch.empty(
-            (_MAX_BATCH, 1536), dtype=torch.bfloat16, device=device
-        ),
-        "hidden.0": torch.empty(
-            (_MAX_BATCH, 7168), dtype=torch.bfloat16, device=device
-        ),
-        "hidden.1": torch.empty(
-            (_MAX_BATCH, 7168), dtype=torch.bfloat16, device=device
-        ),
-        "hidden.out": torch.empty(
-            (_MAX_BATCH, 7168), dtype=torch.bfloat16, device=device
-        ),
-        "prefix": torch.empty((_MAX_BATCH, 7168), dtype=torch.bfloat16, device=device),
-        "blocks": torch.empty(
-            (_MAX_BATCH, 8, 7168), dtype=torch.bfloat16, device=device
-        ),
+        **_batch_scratch(device, heads, mla_pitch, kda_width, batches),
         "moe": moe_state,
     }
     # Explicitly own the side-stream/event lifecycle used by the future executor.
@@ -750,6 +829,24 @@ def build_resources(
     beta = float(backbone.config.activation_situ_beta)
     linear_beta = float(backbone.config.activation_situ_linear_beta)
     moe_layers = [layer for layer in layers if bool(layer._is_moe_layer)]
+    # F-L (K31MK_MOE_FRONT_LAMX; default unset = no box, served code): the MoE front's Lamport x box [2, 32, 7168]
+    # (16-bit words, all 0xFFFF = the sentinel at build). MoE ordinal k's o-proj consumer also stores x into parity k % 2; its front
+    # polls that parity and re-arms parity (k + 1) % 2 (ordinal k - 1's) at its entry. An even MoE count per forward keeps
+    # the forward boundary armed (the last ordinal re-arms the first ordinal's parity).
+    lamx_rows: frozenset = frozenset()
+    if os.environ.get("K31MK_MOE_FRONT_LAMX", ""):
+        lamx_table = front_module.batch_table(os.environ["K31MK_MOE_FRONT_LAMX"])
+        lamx_rows = frozenset(b for b, v in lamx_table.items() if v in (1, 2, 3)) & frozenset(batches)
+    lamx_box = None
+    if lamx_rows:
+        if len(moe_layers) % 2:
+            raise ValueError(f"K31MK_MOE_FRONT_LAMX: needs an even MoE layer count (parity alternation), got {len(moe_layers)}")
+        lamx_box = torch.full((2, 32, 7168), -1, dtype=torch.int16, device=device)
+    route_tap = (
+        route_tap_module.RouteTap(device, [int(layer.layer_idx) for layer in moe_layers], dump=rank == 0)
+        if route_tap_module.enabled()
+        else None
+    )
     attention: dict[int, PreparedAttention] = {}
     feed_forward: dict[int, Any] = {}
     moe_front_weights: dict[int, torch.Tensor] = {}
@@ -761,35 +858,39 @@ def build_resources(
         is_mla = hasattr(module, "q_b_proj")
         if is_mla:
             proxy, _owned = _mla_proxy(module)
-            projection_weight = coalesce_mla_projection_storage(module)
-            if tuple(projection_weight.shape) != (3648, 7168):
+            projection_weight = (
+                packed_projection_weights[layer_id]
+                if packed_projection_weights is not None
+                else mla_storage(module)
+            )
+            if tuple(projection_weight.shape) != (mla_pitch, 7168):
                 raise ValueError(
                     f"layer {layer_id} MLA projection shape changed: "
                     f"{tuple(projection_weight.shape)}"
                 )
-            projection = projection_module.PreparedProjection(
-                projection_weight,
-                {
-                    batch: (
-                        (64, 64, 2, 5)
-                        if batch == 64
-                        else (64, 32, 2, 8)
-                        if batch == 32
-                        else (64, 16, 2, 10)
-                        if batch == 16
-                        else (64, 8, 4, 8)
-                    )
-                    for batch in _BATCHES
-                },
-            ).prepare()
-            core = mla_module.PreparedMla(
-                proxy,
-                {batch: 3648 for batch in _BATCHES},
+            mla_tactics = {
+                batch: projection_module.projection_tactic(
+                    "mla", batch, device, width=mla_pitch
+                )
+                for batch in batches
+            }
+            if qf_g18:  # a reordered copy; the host's packed storage stays as its stock Parameters view it
+                projection_weight = head_gate_module.relayout(projection_weight, heads)
+                projection = head_gate_module.G18Projection(
+                    projection_weight, mla_tactics, heads, projection_module
+                ).prepare()
+            else:
+                projection = projection_module.PreparedProjection(
+                    projection_weight, mla_tactics
+                ).prepare()
+            core = (mla_factory or mla_module.PreparedMla)(
+                proxy if mla_factory is None else (proxy, module.indexer),
+                {batch: mla_pitch for batch in batches},
                 scratch["mla.query"],
                 max_context=int(context_length),
                 core="trtllm",
                 dcp=None,
-                queries=(1,),
+                queries=query_widths,
             )
             if not workspaces:
                 workspace, counter = _prepare_mla_workspace(
@@ -802,8 +903,12 @@ def build_resources(
             kind = "mla"
         else:
             proxy = _kda_proxy(module)
-            projection_weight = coalesce_kda_projection_storage(module)
-            if tuple(projection_weight.shape) != (6288, 7168):
+            projection_weight = (
+                packed_projection_weights[layer_id]
+                if packed_projection_weights is not None
+                else coalesce_kda_projection_storage(module)
+            )
+            if tuple(projection_weight.shape) != (kda_width, 7168):
                 raise ValueError(
                     f"layer {layer_id} KDA projection shape changed: "
                     f"{tuple(projection_weight.shape)}"
@@ -811,33 +916,28 @@ def build_resources(
             projection = projection_module.PreparedProjection(
                 projection_weight,
                 {
-                    batch: (
-                        (64, 64, 1, 6)
-                        if batch == 64
-                        else (128, 32, 2, 5)
-                        if batch == 32
-                        else (128, 16, 2, 6)
-                        if batch == 16
-                        else (128, 8, 2, 6)
+                    batch: projection_module.projection_tactic(
+                        "kda", batch, device, width=kda_width
                     )
-                    for batch in _BATCHES
+                    for batch in batches
                 },
+                fenced_trigger=kda_verify_module.projection_fence(),
             ).prepare()
             core = kda_module.PreparedKda(
                 proxy,
                 {
                     batch: (
-                        6288,
-                        0 if batch in (16, 32, 64) else 1 if batch == 1 else 2,
+                        kda_width,
+                        kda_module.decode_mode(batch, device),
                     )
-                    for batch in _BATCHES
+                    for batch in batches
                 },
                 False,
             )
             kind = "kda"
 
         front = None
-        if layer._is_moe_layer:
+        if layer._is_moe_layer and small_box is not None:
             parity = layer_id % 2
             front = (
                 small_box.front_views[parity],
@@ -847,11 +947,17 @@ def build_resources(
         output = oproj_module.PreparedOproj(
             layer,
             mailbox,
-            _BATCHES,
+            batches,
             is_mla,
             front,
             oproj_twoshot,
             deadline_ns=deadline_ns,
+            **({"cdr_last": layer_id == last_oproj} if oproj_cdr else {}),  # CDR (K31MK_OPROJ_DEFER_REARM)
+            **(
+                {"lamx": (lamx_box[moe_layers.index(layer) % 2].view(torch.bfloat16), lamx_rows)}
+                if lamx_box is not None and layer._is_moe_layer
+                else {}
+            ),  # F-L (K31MK_MOE_FRONT_LAMX): this MoE ordinal's parity of the front's x box
         )
         attention[layer_id] = PreparedAttention(
             layer_id, kind, projection_weight, projection, core, output
@@ -866,7 +972,7 @@ def build_resources(
         if not layer._is_moe_layer:
             feed_forward[layer_id] = dense_module.PreparedDenseMLP(
                 layer.mlp,
-                _BATCHES,
+                batches,
                 reduce=tensor_model_parallel_all_reduce,
             )
             compilation.append(
@@ -875,14 +981,28 @@ def build_resources(
             continue
 
         routed = layer.mlp.experts
-        experts = experts_module.PersistentExperts(
+        # K31MK_MOE_DIES: re-home this layer's routed weights before any engine builds descriptors over them
+        dies = experts_module.place_routed(routed) if tp == 16 and experts_module.dies_enabled() else ()
+        experts_cls, planned_options = experts_module.PersistentExperts, {}
+        if planned_module.enabled():
+            experts_cls, planned_options = planned_module.PlannedExperts, planned_module.options()
+        if tp == 16 and w4a4_module.enabled():
+            experts_cls, planned_options = w4a4_module.W4A4Experts, w4a4_module.options()
+        experts = experts_cls(
             routed.w13_weight,
             routed.w13_weight_scale,
             routed.w2_weight,
             routed.w2_weight_scale,
             beta=beta,
             linear_beta=linear_beta,
+            activation_floor=False if max(query_widths) > 1 else None,
+            **planned_options,
+            # the tail box's rows (the experts' latent slot stride), passed only when it is not 64
+            **({"box_rows": oproj_cap} if oproj_cap != 64 else {}),
+            **({"dies": dies} if dies else {}),
         )
+        if experts_module.w2_one96_enabled():  # : one resident FC2 copy; the stock FusedMoE path refuses
+            experts_module.release_padded_w2(routed, experts)
         op = SimpleNamespace(
             rank=rank,
             contract=SimpleNamespace(
@@ -894,7 +1014,7 @@ def build_resources(
             op,
             layer.mlp.routed_expert_norm.weight,
             layer.mlp.routed_expert_up_proj.weight,
-            _BATCHES,
+            batches,
             (tail_box, ordinal, len(moe_layers)),
             deadline_ns=deadline_ns,
         )
@@ -913,29 +1033,42 @@ def build_resources(
             (router, router.new_zeros((-router_rows % 16, 7168)), down)
         ).detach()
         moe_front_weights[layer_id] = packed_front
+        front_view, front_drr_kw = front_box, {}
+        if front_drr:  # DRR: this MoE ordinal's parity; the last ordinal also re-arms its own cells (forward boundary)
+            front_view = front_module.FrontParityView(front_box, ordinal % 2)
+            front_drr_kw = {"drr": (ordinal % 2, ordinal == len(moe_layers) - 1)}
         generic_front = front_module.SharedFront(
             moe,
             packed_front,
-            front_box,
+            front_view,
             moe_state.front,
-            _BATCHES,
+            batches,
             beta,
             linear_beta,
             plan=moe_state.plan,
+            route_box=moe_state.experts.get("rubin8_workspace"),  # ROUTE_POLL (used only under K31MK_MOE_ROUTE_POLL)
             counters=moe_state.shared,
-            q=1,
+            #  (K31MK_MOE_WIDE_FOLD): the wide engine's plan, which the routing kernel then writes
+            **({"wide_plan": moe_state.experts["rubin_wide"]["plan"]} if "rubin_wide" in moe_state.experts else {}),
+            q=max(query_widths),
             deadline_ns=deadline_ns,
+            **front_drr_kw,  # DRR (K31MK_MOE_ROUTE_DEFER_REARM)
+            **({"lamx": (lamx_box, ordinal % 2)} if lamx_box is not None else {}),  # F-L (K31MK_MOE_FRONT_LAMX)
         )
-        chain = chain_module.SmallBatchChain(
-            small_box,
-            moe,
-            experts,
-            tail,
-            layer_id,
-            beta,
-            linear_beta,
-            None,
-            deadline_ns=deadline_ns,
+        chain = (
+            None
+            if small_box is None
+            else chain_module.SmallBatchChain(
+                small_box,
+                moe,
+                experts,
+                tail,
+                layer_id,
+                beta,
+                linear_beta,
+                None,
+                deadline_ns=deadline_ns,
+            )
         )
         prepared_moe = prepared_moe_module.PreparedMoE(
             generic_front,
@@ -946,6 +1079,7 @@ def build_resources(
             layer_idx=layer_id,
         )
         prepared_moe.small_batch = chain
+        prepared_moe.tap = route_tap
         feed_forward[layer_id] = prepared_moe
         compilation.extend(
             (
@@ -986,7 +1120,14 @@ def build_resources(
     for layer, consumer in zip(layers, followers):
         if not layer._is_moe_layer:
             continue
-        consumer.bind_ring(tail_box.out.buffer)
+        if tail_box.dra:
+            # K31MK_ATTNRES_DEFER_REARM (DRA): ordinal k polls parity k % 2 and re-arms parity (k - 1) % 2
+            # (k > 0) before its poll; the last ordinal also re-arms its own rows (both parities armed at the end).
+            k = moe_layers.index(layer)
+            prev_view = tail_box.out_parity((k - 1) % 2)[0] if k > 0 else None
+            consumer.bind_ring(tail_box.out_parity(k % 2)[0], previous=prev_view, own=k == len(moe_layers) - 1)
+        else:
+            consumer.bind_ring(tail_box.out.buffer)
         fused_before[int(layer.layer_idx)] = consumer
 
     torch.cuda.synchronize()
@@ -1008,6 +1149,7 @@ def build_resources(
         memory_before=memory_before,
         memory_after=_cuda_memory(),
         deadline_ns=deadline_ns,
+        heads=heads,
     )
     resources.refresh_inventory()
     return resources

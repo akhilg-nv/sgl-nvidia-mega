@@ -124,13 +124,20 @@ def test_exact_six_reachable_tp8_remote_poll_definitions_fail_stop():
         assert _calls(node, "wait_deadline_check") == 1, (relative, qualname)
 
 
+def test_tp16_wave_tail_row_poll_fails_stop():
+    """``WaveMoeTail.poll_rows`` also polls the two-shot gather rows that other ranks multicast (rows 33-128): a peer that
+    traps never publishes them, so the poll must fail stop at the build deadline, as ``settle`` does, not spin."""
+    node = _definition("cutedsl/moe/tail.py", "WaveMoeTail", "poll_rows")
+    assert _calls(node, "wait_deadline_start") == 1
+    assert _calls(node, "wait_deadline_check") == 1
+
+
 def test_local_and_dormant_waits_are_not_instrumented():
     definitions = (
         ("cutedsl/common/primitives.py", ("wait",)),
         ("cutedsl/common/primitives.py", ("wait_phase_zero_cluster",)),
         ("cutedsl/common/primitives.py", ("wait_tmem",)),
         ("cutedsl/moe/tail.py", ("MoeTail", "front")),
-        ("cutedsl/moe/tail.py", ("WaveMoeTail", "poll_rows")),
         (
             "cutedsl/moe/small_batch/front_tp16.py",
             ("MoeFrontTP16", "poll_flag"),

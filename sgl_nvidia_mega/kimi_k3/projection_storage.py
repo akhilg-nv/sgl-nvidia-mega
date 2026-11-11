@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Share Kimi K3 attention projection storage with the megakernel.
 
 The stock model must remain usable for shapes the megakernel does not serve.
@@ -46,29 +47,39 @@ class _Layout:
         return sum(part.rows for part in self.parts) + self.padding_rows
 
 
-_MLA_LAYOUT = _Layout(
-    name="MLA",
-    parts=(
-        _Part("fused_qkv_a_proj_with_mqa.weight", 2112),
-        _Part("g_proj.weight", 1536),
-    ),
-    columns=7168,
-    dtype=torch.bfloat16,
-)
+def mla_layout(heads: int = 12) -> _Layout:
+    """[q_a | kv_a | gate] of ``heads`` local heads (TP8 12 -> 3648 rows, TP16 6 -> 2880)."""
+    return _Layout(
+        name="MLA",
+        parts=(
+            _Part("fused_qkv_a_proj_with_mqa.weight", 2112),
+            _Part("g_proj.weight", heads * 128),
+        ),
+        columns=7168,
+        dtype=torch.bfloat16,
+    )
 
-_KDA_LAYOUT = _Layout(
-    name="KDA",
-    parts=(
-        _Part("fused_qkvg_proj.weight", 6144),
-        _Part("f_a_proj.weight", 128),
-        _Part("b_proj.weight", 12),
-    ),
-    columns=7168,
-    dtype=torch.bfloat16,
-    alias_name="_bfa_w",
-    alias_part=1,
-    padding_rows=4,
-)
+
+def kda_layout(heads: int = 12) -> _Layout:
+    """[qkvg | f_a | beta | pad] of ``heads`` local heads (TP8 6288 rows with 4 padding, TP16 3216 with 10)."""
+    raw = 4 * heads * 128 + 128 + heads
+    return _Layout(
+        name="KDA",
+        parts=(
+            _Part("fused_qkvg_proj.weight", 4 * heads * 128),
+            _Part("f_a_proj.weight", 128),
+            _Part("b_proj.weight", heads),
+        ),
+        columns=7168,
+        dtype=torch.bfloat16,
+        alias_name="_bfa_w",
+        alias_part=1,
+        padding_rows=-raw % _ALIGNMENT,
+    )
+
+
+_MLA_LAYOUT = mla_layout(12)
+_KDA_LAYOUT = kda_layout(12)
 
 
 def _resolve_parameter(owner: Any, path: str) -> torch.nn.Parameter:
@@ -332,13 +343,25 @@ def _coalesce_projection_storage(
     return root
 
 
+def local_mla_heads(attention: Any) -> int:
+    """Local MLA heads from the TP-sharded output gate (TP8 12, TP16 6)."""
+    return int(_resolve_parameter(attention, "g_proj.weight").shape[0]) // 128
+
+
+def local_kda_heads(attention: Any) -> int:
+    """Local KDA heads from the TP-sharded beta projection (TP8 12, TP16 6)."""
+    return int(_resolve_parameter(attention, "b_proj.weight").shape[0])
+
+
 def coalesce_mla_projection_storage(attention: Any) -> torch.Tensor:
     """Return MLA's [qkv-a | gate] weight without retaining a second copy."""
 
-    return _coalesce_projection_storage(attention, _MLA_LAYOUT, device_type="cuda")
+    layout = mla_layout(local_mla_heads(attention))
+    return _coalesce_projection_storage(attention, layout, device_type="cuda")
 
 
 def coalesce_kda_projection_storage(attention: Any) -> torch.Tensor:
     """Return KDA's [qkvg | f-a | beta | pad] weight as shared model storage."""
 
-    return _coalesce_projection_storage(attention, _KDA_LAYOUT, device_type="cuda")
+    layout = kda_layout(local_kda_heads(attention))
+    return _coalesce_projection_storage(attention, layout, device_type="cuda")

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Small-batch routed experts: ``ClusterExpertsTP16`` (TP16 B1/B2, six-CTA split-K
 clusters exchanging quantized hidden rows) and ``ClusterExpertsTP8`` (TP8 B1, one
 six-CTA cluster per routing slot)."""
@@ -14,6 +15,7 @@ from cutlass.cute.arch import store_async_dsmem
 from ...common.primitives import (
     acquire_tensormap_asm,
     alloc,
+    bits_float,
     chunk_mma,
     commit_asm,
     copy_evict,
@@ -36,7 +38,6 @@ from ...common.primitives import (
     release_tmem,
     require_zero_tmem,
     shared_address,
-    situ,
     smem_desc,
     split,
     store_bf16_pair,
@@ -49,20 +50,27 @@ from ...common.primitives import (
     wait_tmem,
     warp_max_abs,
 )
+from ..experts import hidden_exponent
+
+from ..math import routed_situ as situ
 
 
 @cute.jit
-def quantize_mx8(packed, row):
+def quantize_mx8(packed, row, fp32: cutlass.Constexpr = False):
     """(E8M0 scale, FP8 words) of eight BF16 values; four lanes share a 32-block."""
     values = cute.make_rmem_tensor(8, Float32)
-    for k in cutlass.range_constexpr(4):
-        values[2 * k], values[2 * k + 1] = unpack_bf16(packed[row, k])
+    if cutlass.const_expr(fp32):
+        for k in cutlass.range_constexpr(8):
+            values[k] = bits_float(packed[row, k])
+    else:
+        for k in cutlass.range_constexpr(4):
+            values[2 * k], values[2 * k + 1] = unpack_bf16(packed[row, k])
     amax = Float32(0)
     for k in cutlass.range_constexpr(8):
         amax = max(amax, abs(values[k]))
     for k in (1, 2):
         amax = max(amax, cute.arch.shuffle_sync_bfly(amax, k))
-    sb = mx_exponent(amax)
+    sb = mx_exponent(max(amax, Float32(1e-10)))
     rs = mx_rescale(sb)
     lo, hi = (pack_fp8([values[4 * h + k] * rs for k in range(4)]) for h in (0, 1))
     return sb, (lo, hi)
@@ -81,9 +89,10 @@ class _ClusterExperts:
 
 class ClusterExpertsTP16(_ClusterExperts):
     """Paired CTAs split FC1 and exchange quantized hidden rows; the TP16 intermediate
-    has 192 live values padded to 256. IDs [B, 16], x BF16 [B, 3584], output BF16
-    [B * 16, 3584]. Polled IDs are re-armed per cluster; the caller re-arms latent rows
-    after all consumers complete."""
+    has 192 live values padded to 256. IDs [B, 16], x FP32 [B, 3584] (the front's FP32
+    latent, quantized to MXFP8 here as stock does), output BF16 [B * 16, 3584]. Polled
+    IDs are re-armed per cluster; the caller re-arms latent rows after all consumers
+    complete."""
 
     threads = 288
 
@@ -248,19 +257,22 @@ class ClusterExpertsTP16(_ClusterExperts):
                         cute.arch.sync_warp()
         else:
             n = warp - 2
-            packed = cute.make_rmem_tensor((self.batch, 4), Uint32)
+            # Eight FP32 latent words per lane (stock quantizes the FP32 front output; A4),
+            # polled until no word is the 0x80000000 sentinel.
+            packed = cute.make_rmem_tensor((self.batch, 8), Uint32)
             for t in cutlass.range_constexpr(self.batch):
                 pointer = x.iterator + t * 3584 + 1792 * half + 256 * n + lane * 8
                 ready = False
                 while not ready:
-                    words = load_volatile(pointer, count=4)
-                    ready = published(words)
+                    low = load_volatile(pointer, count=4)
+                    high = load_volatile(pointer + 4, count=4)
+                    ready = published(low) & published(high)
                     for k in cutlass.range_constexpr(4):
-                        packed[t, k] = words[k]
+                        packed[t, k], packed[t, k + 4] = low[k], high[k]
             block, k = lane // 4, lane % 4
             kc, kb = 16 * n + 2 * block + k // 2, 8 * n + block
             for t in cutlass.range_constexpr(self.batch):
-                sb, words = quantize_mx8(packed, t)
+                sb, words = quantize_mx8(packed, t, fp32=True)
                 offset = self.off_x + kc // 8 * 1024 + t * 128 + ((kc % 8) ^ t) * 16
                 offset += (k % 2) * 8
                 store_shared_words(sm.iterator + offset, words)
@@ -473,7 +485,8 @@ class ClusterExpertsTP8(_ClusterExperts):
                     n += 1
         else:
             xtid = tid - 64
-            packed = cute.make_rmem_tensor((3, 4), Uint32)
+            fp32: cutlass.Constexpr = x.element_type == Float32
+            packed = cute.make_rmem_tensor((3, 8 if fp32 else 4), Uint32)
             for i in cutlass.range_constexpr(3):
                 if 32 * (warp - 2) + 192 * i < 448:
                     words = load_words(
@@ -481,10 +494,15 @@ class ClusterExpertsTP8(_ClusterExperts):
                     )
                     for k in cutlass.range_constexpr(4):
                         packed[i, k] = words[k]
+                    if cutlass.const_expr(fp32):
+                        high = load_words(x.iterator + 8 * (xtid + 192 * i) + 4,
+                                          count=4, mutable=True)
+                        for k in cutlass.range_constexpr(4):
+                            packed[i, k + 4] = high[k]
             for i in cutlass.range_constexpr(3):
                 f = xtid + 192 * i
                 if 32 * (warp - 2) + 192 * i < 448:
-                    sb, words = quantize_mx8(packed, i)
+                    sb, words = quantize_mx8(packed, i, fp32=fp32)
                     kc, chunk = f // 16, (f % 16) // 2
                     offset = self.off_x + kc * 128 + (chunk ^ kc % 8) * 16 + f % 2 * 8
                     store_shared_words(sm.iterator + offset, words)
@@ -512,7 +530,7 @@ class ClusterExpertsTP8(_ClusterExperts):
                 if lane == 0:
                     maxima[ew] = amax
                 cute.arch.barrier(barrier_id=1, number_of_threads=128)
-                sb = mx_exponent(max(amax, maxima[ew ^ 1]), True)
+                sb = hidden_exponent(max(amax, maxima[ew ^ 1]))
                 if up:
                     byte = fp8_bits(hidden * mx_rescale(sb))
                     sm[self.off_stage + ew * 16 + local] = byte
@@ -522,8 +540,8 @@ class ClusterExpertsTP8(_ClusterExperts):
                     words = load_words(src, count=4, shared=True)
                     kc = 4 * rank + ew
                     offset = self.off_h + (kc // 8) * 1024 + (kc % 8) * 16
-                    sw = Uint32(mx_exponent(max(maxima[0], maxima[1]), True))
-                    sw |= Uint32(mx_exponent(max(maxima[2], maxima[3]), True)) << 8
+                    sw = Uint32(hidden_exponent(max(maxima[0], maxima[1])))
+                    sw |= Uint32(hidden_exponent(max(maxima[2], maxima[3]))) << 8
                     for peer in range(6):
                         dst = sm.iterator + cute.assume(offset, divby=16)
                         store_async_dsmem(dst, words, hbar, peer)

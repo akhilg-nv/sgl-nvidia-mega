@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Prepared first dense MLP, sharing projection and SiTU decode arithmetic."""
 
 from functools import cache
@@ -36,7 +37,7 @@ class DenseSitu:
             if col < self.hidden:
                 gate = cutlass.Float32(x[row, col])
                 up = cutlass.Float32(x[row, self.hidden + col])
-                value = situ(gate, up, beta, linear, native=True)
+                value = situ(gate, up, beta, linear)
             out[row, col] = cutlass.BFloat16(value)
         cute.arch.griddepcontrol_launch_dependents()
 
@@ -60,13 +61,15 @@ class PreparedDenseMLP:
         self.scalars = tuple(map(cutlass.Float32, (mlp.act_fn.beta, linear)))
         if padded != hidden:
             down = torch.nn.functional.pad(down.detach(), (0, padded - hidden))
-        self.gates = gate_up.new_empty((64, 2 * hidden))
-        self.hidden_rows = gate_up.new_empty((64, padded))
-        tile = {b: next(n for n in (8, 16, 32, 64) if b <= n) for b in batches}
+        # Scratch rows: 64, or the boot's largest batch when that is more (verify at Breq 16 = 128 rows).
+        rows = max(64, *batches)
+        self.gates = gate_up.new_empty((rows, 2 * hidden))
+        self.hidden_rows = gate_up.new_empty((rows, padded))
+        tile = {b: next(n for n in (8, 16, 32, 64, 128) if b <= n) for b in batches}
         up_tiles = {8: (64, 8, 4, 8), 16: (64, 16, 2, 8), 32: (64, 32, 2, 8)}
-        up_tiles[64] = (64, 64, 2, 5)
+        up_tiles[64] = up_tiles[128] = (64, 64, 2, 5)  # 128 rows: the 64-row tactic over two row tiles (not swept)
         down_tiles = {8: (128, 8, 1, 6), 16: (128, 16, 1, 6), 32: (128, 32, 1, 5)}
-        down_tiles[64] = (64, 64, 1, 5)
+        down_tiles[64] = down_tiles[128] = (64, 64, 1, 5)
         policy = lambda tiles: {b: tiles[n] for b, n in tile.items()}
         self.gate = PreparedProjection(gate_up, policy(up_tiles))
         self.down = PreparedProjection(down, policy(down_tiles))

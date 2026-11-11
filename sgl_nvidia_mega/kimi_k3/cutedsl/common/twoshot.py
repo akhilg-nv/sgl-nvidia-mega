@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Options described as "ported" follow NVIDIA's Rubin (sm_107) specialized-decode kernels (the rubin package).
 """Two-shot Lamport all-reduce of BF16 rows [B, width] over TP ranks.
 
 Rank ``o`` owns columns [o W, (o + 1) W), W = width / owners. Every buffer is
@@ -9,7 +11,8 @@ Lamport-armed and only its local reader re-arms it:
   receive slot [rank] (a peer store; the owner's ``recv`` [TP, cap, W]; callers with a
   runtime parity pass the whole [parities x TP, cap, W] and slot parity x TP + rank).
 - ``reduce``: the owner polls the TP slots of an owned chunk in its own memory, sums
-  them in FP32 in rank order, rounds once and multicasts the BF16 sum into every
+  them in FP32 in rank order (then adds an optional replicated residual, as stock's fused
+  all-reduce + residual does), rounds once and multicasts the BF16 sum into every
   rank's gather row [cap, width]; then re-arms the slots.
 - every rank then polls its gather row (one slot) and re-arms it.
 
@@ -26,7 +29,7 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass import Float32, Int32, Int64, Uint32
 
-from .mailbox import rearm
+from .mailbox import rearm, rearm_fence
 from .primitives import (
     add_rn,
     at,
@@ -85,6 +88,41 @@ def push(recv, peers, slot, token, column, words):
 
 
 @cute.jit
+def poll_slots(recv, raw, token, local, deadline_ns: cutlass.Constexpr[int]):
+    """Lamport-poll the TP receive slots of (token, local) into ``raw`` (the vendored
+    ``common.twoshot.poll_slots``, plus our build deadline): each pass reloads
+    every slot straight into ``raw`` and then checks them all, until none holds the
+    sentinel. A published slot keeps its words until this reader re-arms it, so
+    reloading it is harmless; loading only the pending slots goes through predicated
+    temporaries merged into ``raw`` a few loads at a time, i.e. several dependent round
+    trips per pass (16 ranks, M64 o-projection: owner reduce done measurably sooner
+    after the last push)."""
+    pending = poll_pass(recv, raw, token, local)
+    started, polls = Int64(0), Int32(0)
+    if pending != 0:
+        started = wait_deadline_start(deadline_ns)
+    while pending != 0:
+        polls = wait_deadline_check(started, polls, deadline_ns)
+        pending = poll_pass(recv, raw, token, local)
+
+
+@cute.jit
+def poll_pass(recv, raw, token, local):
+    """One ``poll_slots`` pass: reload every slot into ``raw``, then return the mask of
+    slots still holding the sentinel."""
+    tp: cutlass.Constexpr = recv.shape[0]
+    for slot in cutlass.range_constexpr(tp):
+        words = load_vector(at(recv, slot, token, local), cache="volatile")
+        for j in cutlass.range_constexpr(4):
+            raw[slot, j] = words[j]
+    pending = Int32(0)
+    for slot in cutlass.range_constexpr(tp):
+        if not published(raw[slot, j] for j in range(4)):
+            pending |= 1 << slot
+    return pending
+
+
+@cute.jit
 def reduce(
     recv,
     gather,
@@ -93,38 +131,50 @@ def reduce(
     token,
     column,
     deadline_ns: cutlass.Constexpr[int],
+    residual=None,
+    batched: cutlass.Constexpr = False,
 ):
-    """Owner of (token, column): the TP slots summed in FP32 in rank order, rounded
-    once (no negative zero, the sentinel), multicast to every gather row; slots
-    re-armed. Returns nothing; callers then poll ``gather`` like a one-slot mailbox."""
+    """Owner of (token, column): the TP slots summed in FP32 in rank order, plus
+    ``residual`` (8 FP32 values of this chunk, identical on every rank) when given,
+    rounded once (no negative zero, the sentinel), multicast to every gather row; slots
+    re-armed. Returns nothing; callers then poll ``gather`` like a one-slot mailbox.
+    ``batched`` (Rubin, the ported TWOSHOT_BATCHED): the slots are polled
+    by ``poll_slots`` (every load of a pass in flight); otherwise a pass re-polls only
+    the pending slots. The same words are summed in the same order either way."""
     tp: cutlass.Constexpr = recv.shape[0]
     local = column - rank * recv.shape[2]
     raw = zeros((tp, 4), Uint32)
-    pending = Int32((1 << tp) - 1)
-    for slot in cutlass.range_constexpr(tp):
-        words = load_vector(at(recv, slot, token, local), cache="volatile")
-        for j in cutlass.range_constexpr(4):
-            raw[slot, j] = words[j]
-        if published(words):
-            pending &= ~(1 << slot)
-    started, polls = Int64(0), Int32(0)
-    if pending != 0:
-        started = wait_deadline_start(deadline_ns)
-    while pending != 0:
-        polls = wait_deadline_check(started, polls, deadline_ns)
+    if cutlass.const_expr(batched):
+        poll_slots(recv, raw, token, local, deadline_ns)
+    else:
+        pending = Int32((1 << tp) - 1)
         for slot in cutlass.range_constexpr(tp):
-            if (pending & (1 << slot)) != 0:
-                words = load_vector(at(recv, slot, token, local), cache="volatile")
-                for j in cutlass.range_constexpr(4):
-                    raw[slot, j] = words[j]
-                if published(words):
-                    pending &= ~(1 << slot)
+            words = load_vector(at(recv, slot, token, local), cache="volatile")
+            for j in cutlass.range_constexpr(4):
+                raw[slot, j] = words[j]
+            if published(words):
+                pending &= ~(1 << slot)
+        started, polls = Int64(0), Int32(0)
+        if pending != 0:
+            started = wait_deadline_start(deadline_ns)
+        while pending != 0:
+            polls = wait_deadline_check(started, polls, deadline_ns)
+            for slot in cutlass.range_constexpr(tp):
+                if (pending & (1 << slot)) != 0:
+                    words = load_vector(at(recv, slot, token, local), cache="volatile")
+                    for j in cutlass.range_constexpr(4):
+                        raw[slot, j] = words[j]
+                    if published(words):
+                        pending &= ~(1 << slot)
     values = cute.make_rmem_tensor(8, Float32)
     for j in cutlass.range_constexpr(4):
         low, high = unpack_bf16(raw[0, j])
         for slot in cutlass.range_constexpr(1, tp):
             a, b = unpack_bf16(raw[slot, j])
             low, high = add_rn(low, a), add_rn(high, b)
+        if cutlass.const_expr(residual is not None):
+            low = add_rn(low, residual[2 * j])
+            high = add_rn(high, residual[2 * j + 1])
         values[2 * j], values[2 * j + 1] = low, high
     words = tuple(
         pack_pair(values[2 * j], values[2 * j + 1], policy="latent") for j in range(4)
@@ -133,3 +183,4 @@ def reduce(
     multicast_words(gather_mc + Int64(offset) * 2, words)
     for slot in cutlass.range_constexpr(tp):
         rearm(at(recv, slot, token, local))
+    rearm_fence()

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Persistent routed experts: TMA producer, MXFP8 activations, FP4 x MXFP8 FC1/FC2 MMAs,
 SiTU hidden exchange and output epilogue. Capacity <= 8 keeps the batch's activations in
 SMEM; capacity > 8 (grouped) runs (expert, <= 8 tokens) units whose FC1 stages gather
@@ -7,7 +8,7 @@ SMEM; capacity > 8 (grouped) runs (expert, <= 8 tokens) units whose FC1 stages g
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint32, Uint64
+from cutlass import Float32, Int8, Int16, Int32, Int64, Uint8, Uint16, Uint32, Uint64
 
 from ..common.primitives import (
     acquire_tensormap,
@@ -32,11 +33,11 @@ from ..common.primitives import (
     multicast_words,
     mx_exponent,
     mx_rescale,
+    named_barrier,
     pack_fp8,
     pack_pair,
     release_tmem,
     shared_address,
-    situ,
     smem_desc,
     smem_words,
     store_shared_words,
@@ -48,23 +49,63 @@ from ..common.primitives import (
     wait_tmem,
 )
 from ..common.twoshot import push
+from .math import reciprocal, routed_situ_hoisted
+from .math import routed_situ as situ
 
 shuffle = cute.arch.shuffle_sync
+
+
+@cute.jit
+def hidden_exponent(amax, floor: cutlass.Constexpr[bool] = False):
+    """Stock FC1 uses scale 1 for an all-zero block, distinct from input quant."""
+    return Int32(127) if amax == 0 else mx_exponent(amax, floor=floor)
+
+
+@asm(Int64)
+def clock64():
+    """SM cycle counter (producer pacer)."""
+    return "mov.u64 $0, %clock64;", "=l", ()
+
+
+# Capacity of the per-CTA counter, claim and partial-slot arrays in the workspace.
+# Covers every grid on the supported parts (at most 256 CTAs).
+MAX_CTAS = 256
 
 
 class ExpertsGeometry:
     """Static plain-input geometry. No cluster-local or multicast storage. The workspace
     is capacity-independent; capacity > 8 swaps the batch's SMEM activation image for
     per-slot 8-row images, which frees a sixth weight stage, and keeps per-CTA windows
-    of the unit tables (expert, 8 pair rows) in the misc block."""
+    of the unit tables (expert, 8 pair rows) in the misc block. ``packed`` (TP16, capacity
+    <= 8; ``K31MK_EXPERTS_PACKED_K64``): the weights land as packed E2M1 bytes in 16 KB
+    slots (``packed_stages`` of them) for Rubin's K64 MMAs (``stage(packed=True)``); SMEM
+    stays at least the unpacked size so one CTA holds each SM (each allocates all 512
+    TMEM columns). Slot geometry after the vendored RubinExpertsKernel (``..rubin``)."""
 
-    def __init__(self, tp, capacity=8):
+    def __init__(self, tp, capacity=8, packed=False, packed_stages=6, packed_fc1=False, packed_fc2=False):
         self.tp = tp
         self.tiles, self.w13_rows, self.h_chunks, self.fc2_stages = (
             (6, 768, 3, 2) if tp == 8 else (3, 512, 2, 1)
         )
         self.grouped = capacity > 8
-        self.stages = stages = 6 if self.grouped else 5
+        self.packed = packed
+        assert not packed or (tp == 16 and not self.grouped), (tp, capacity)
+        # ``packed_fc1`` (TP8 grouped, ``K31MK_MOE_TP8_PACKED_FC1``, default off): FC1 stages land packed E2M1 bytes (one
+        # 128 B x 128-row UINT8 box = K256 through map 6, at byte 768 of the maps) in the first 16 KB of the 32 KB slots and run
+        # the dense K64 MMAs of ``stage(packed=True)``; FC2 keeps the 16U4 tile pairs.
+        self.packed_fc1 = packed_fc1
+        assert not packed_fc1 or (tp == 8 and self.grouped and not packed), (tp, capacity, packed)
+        self.fc1_packed = bool(packed or packed_fc1)
+        self.fc1_map = 768 if packed_fc1 else 0
+        # ``packed_fc2`` (TP8 grouped tile pairs, ``K31MK_MOE_TP8_PACKED_FC2``, default off): chunks 0-1 of each tile land as one packed
+        # 128 B x 128-row UINT8 box (map 7, K256), chunk 2 of both tiles as one 64 B x 256-row box (map 8, K128; 128 B per row in SMEM
+        # under the 128B swizzle, so the 32 KB slot holds it as it held the 16U4 box); dense K64 MMAs.
+        self.packed_fc2 = packed_fc2
+        assert not packed_fc2 or (tp == 8 and self.grouped and not packed), (tp, capacity, packed)
+        self.fc2_map, self.fc2c_map = (896, 1024) if packed_fc2 else (128, 640)
+        self.fc2c_chunk = 0 if packed_fc2 else 2
+        self.slot_bytes = 16384 if packed else 32768
+        self.stages = stages = packed_stages if packed else 6 if self.grouped else 5
         self.units = 16 * capacity if self.grouped else 128
         self.w13_scale_bytes = self.w13_rows * 112
         self.w2_scale_columns = 4 * self.h_chunks
@@ -73,13 +114,15 @@ class ExpertsGeometry:
         self.h_image_bytes = self.h_chunks * 1024
         self.h_scale_bytes = self.h_chunks * 128 + 384
         self.h_compact_bytes = self.h_image_bytes + 128
-        self.off_sfa = stages * 32768
+        self.off_sfa = stages * self.slot_bytes
         self.off_x = self.off_sfa + stages * 1024
         self.off_h = self.off_x + (stages * 2048 if self.grouped else 28672)
         self.off_xsf = self.off_h + 2 * self.h_image_bytes
         self.off_hsf = self.off_xsf + (stages * 256 if self.grouped else 28 * 128) + 384
         self.off_misc = self.off_hsf + 2 * self.h_scale_bytes
         self.smem_bytes = self.off_misc + 5120
+        if packed:
+            self.smem_bytes = max(self.smem_bytes, ExpertsGeometry(tp, capacity).smem_bytes)
         # Misc barriers (byte offsets): weight full/empty [stages], accumulator
         # full/empty [16], hidden full/empty [2], x ready [14]. Grouped stage metadata
         # and unit windows (4 x 16 units) use the B<=8 routing tables' space.
@@ -88,23 +131,26 @@ class ExpertsGeometry:
         self.bar_accempty, self.bar_hfull = (acc + 128, acc + 256)
         self.bar_hempty, self.bar_xready = (acc + 272, acc + 288)
         self.off_meta = self.off_misc + (1152 if self.grouped else 520)
+        if packed:  # > 5 stages: 520 + 16 * stages would reach the accumulator metadata (misc 600)
+            self.off_meta = self.off_misc + 4352  # free below the steal queue (misc 4608)
+            assert 4352 + 16 * stages <= 4608 and 2 * stages + 50 <= 65, stages
         self.off_window = self.off_misc + 1280
         # Stealing: FC2 unit queue (producer -> hidden loader) [8], full/empty [8, 8].
         self.off_queue, self.bar_queue = (self.off_misc + 4608, 4640)
         self.ws_partial = 2 * 128 * self.h_compact_bytes
-        self.ws_counter = self.ws_partial + 2 * 160 * 8 * 128 * 4
-        self.ws_xflag = self.ws_counter + 160 * 4
-        self.ws_stage = (self.ws_xflag + 160 * 4 + 255) // 256 * 256
+        self.ws_counter = self.ws_partial + 2 * MAX_CTAS * 8 * 128 * 4
+        self.ws_xflag = self.ws_counter + MAX_CTAS * 4
+        self.ws_stage = (self.ws_xflag + MAX_CTAS * 4 + 255) // 256 * 256
         # Publish stage rows [64 tokens x 16 slots, 3584] BF16, then grouped: call
-        # counters [160] and unit counts [2], hidden images [2, 1024].
+        # counters [MAX_CTAS] and unit counts [2], hidden images [2, 1024].
         self.ws_calls = self.ws_stage + 1024 * 3584 * 2
-        self.ws_units = self.ws_calls + 1024
+        self.ws_units = self.ws_calls + (4 * (MAX_CTAS + 2) + 1023) // 1024 * 1024
         # Pregrouped unit table (``ExpertsGroupKernel``): header (units, call, grouped
         # call), experts [1024], rows [1024, 8].
         self.ws_group = self.ws_units + 2 * 1024 * self.h_compact_bytes
-        # FC2(B) tail claim counters [2 parities, 160] (``ExpertsKernel.steal``).
+        # FC2(B) tail claim counters [2 parities, MAX_CTAS] (``ExpertsKernel.steal``).
         self.ws_steal = self.ws_group + 16 + 20 * 1024
-        self.workspace_bytes = self.ws_steal + 2 * 160 * 4
+        self.workspace_bytes = self.ws_steal + 2 * MAX_CTAS * 4
 
     def image(self, workspace, parity, unit):
         """Compact hidden image of ``unit`` in the ``parity`` half of the workspace."""
@@ -133,13 +179,19 @@ def mx_block(words):
     for i in cutlass.range_constexpr(16):
         pair = unpack_bf16(words[i])
         values[2 * i], values[2 * i + 1] = (pair[0], pair[1])
+    return mx_values(values)
+
+
+@cute.jit
+def mx_values(values):
+    """Stock FP32 input quantization; no BF16 conversion before absmax/scaling."""
     maxima = cute.make_rmem_tensor(16, Float32)
     for j in cutlass.range_constexpr(16):
         maxima[j] = cute.arch.fmax(abs(values[j]), abs(values[j + 16]))
     for width in (8, 4, 2, 1):
         for j in cutlass.range_constexpr(width):
             maxima[j] = cute.arch.fmax(maxima[j], maxima[j + width])
-    scale = mx_exponent(maxima[0])
+    scale = mx_exponent(max(maxima[0], Float32(1e-10)))
     reciprocal = mx_rescale(scale)
     packed = [
         pack_fp8(tuple(values[4 * j + i] * reciprocal for i in range(4)))
@@ -156,20 +208,24 @@ PLAN_BYTES = PLAN_XSF + 64 * 448
 
 
 @cute.jit
-def plan_chunk(plan, token, chunk, words):
+def plan_chunk(plan, token, chunk, words, fp32: cutlass.Constexpr = False):
     """Write 8-element ``chunk`` (four BF16x2 ``words``) of ``token`` as MXFP8 into
     the plan; lanes 4k..4k+3 hold one 32-element block, 16 lanes one scale word.
     Bit-identical to ``mx_block`` (an exact max, the same scaling and packing)."""
     lane, values = (thread()[2], cute.make_rmem_tensor(8, Float32))
-    for i in cutlass.range_constexpr(4):
-        pair = unpack_bf16(words[i])
-        values[2 * i], values[2 * i + 1] = (pair[0], pair[1])
+    if cutlass.const_expr(fp32):
+        for i in cutlass.range_constexpr(8):
+            values[i] = bits_float(words[i])
+    else:
+        for i in cutlass.range_constexpr(4):
+            pair = unpack_bf16(words[i])
+            values[2 * i], values[2 * i + 1] = (pair[0], pair[1])
     top = abs(values[0])
     for i in cutlass.range_constexpr(1, 8):
         top = cute.arch.fmax(top, abs(values[i]))
     for width in (1, 2):
         top = cute.arch.fmax(top, cute.arch.shuffle_sync_bfly(top, width))
-    scale = mx_exponent(top)
+    scale = mx_exponent(max(top, Float32(1e-10)))
     reciprocal = mx_rescale(scale)
     packed = [
         pack_fp8(tuple(values[4 * j + i] * reciprocal for i in range(4)))
@@ -181,6 +237,36 @@ def plan_chunk(plan, token, chunk, words):
         word |= shuffle(Uint32(scale), lane + 4 * s) << 8 * s
     if chunk % 16 == 0:
         dst = plan.iterator + PLAN_XSF + token * 448 + chunk // 16 * 16
+        store_words(dst, (word, Uint32(0), Uint32(0), Uint32(0)))
+
+
+@cute.jit
+def plan_image_chunk_f32(plan, token, chunk, words):
+    """``plan_chunk(fp32=True)``'s MXFP8 of the FP32 latent (the same values, scale floor and packing) stored in the
+    vendored RubinExpertsKernel's SMEM image layout (``rubin.moe.experts_rubin.image_chunk``: 128B-swizzled 8-row image,
+    the scale words at 14 x 2048), so that kernel reads our quantization of the FP32 latent."""
+    lane, values = (thread()[2], cute.make_rmem_tensor(8, Float32))
+    for i in cutlass.range_constexpr(8):
+        values[i] = bits_float(words[i])
+    top = abs(values[0])
+    for i in cutlass.range_constexpr(1, 8):
+        top = cute.arch.fmax(top, abs(values[i]))
+    for width in (1, 2):
+        top = cute.arch.fmax(top, cute.arch.shuffle_sync_bfly(top, width))
+    scale = mx_exponent(max(top, Float32(1e-10)))
+    reciprocal = mx_rescale(scale)
+    packed = [
+        pack_fp8(tuple(values[4 * j + i] * reciprocal for i in range(4)))
+        for j in range(2)
+    ]
+    wide = chunk >> 1
+    offset = wide // 8 * 1024 + token * 128 + (wide % 8 ^ token) * 16 + (chunk & 1) * 8
+    store_words(plan.iterator + offset, packed)
+    word = Uint32(scale)
+    for s in cutlass.range_constexpr(1, 4):
+        word |= shuffle(Uint32(scale), lane + 4 * s) << 8 * s
+    if chunk % 16 == 0:
+        dst = plan.iterator + 14 * 2048 + chunk // 16 * 128 + token * 16
         store_words(dst, (word, Uint32(0), Uint32(0), Uint32(0)))
 
 
@@ -202,24 +288,48 @@ class ExpertsPlanKernel:
         for i in cutlass.range_constexpr(2):
             chunk = tid + 256 * i
             if chunk < 448:  # warp-uniform: chunks 256-447 are warps 0-5
-                words = load_words(
-                    x.iterator + token * 3584 + chunk * 8, count=4, mutable=True
-                )
-                plan_chunk(plan, token, chunk, words)
+                source = x.iterator + token * 3584 + chunk * 8
+                if cutlass.const_expr(x.element_type == Float32):
+                    words = (*load_words(source, count=4, mutable=True),
+                             *load_words(source + 4, count=4, mutable=True))
+                    plan_chunk(plan, token, chunk, words, fp32=True)
+                else:
+                    words = load_words(source, count=4, mutable=True)
+                    plan_chunk(plan, token, chunk, words)
         cute.arch.griddepcontrol_launch_dependents()
 
 
 @asm()
-def stage(mma, weight_scales, activation_scales, release, done, *, kind):
+def stage(
+    mma, weight_scales, activation_scales, release, done, *, kind, wide=False, chain2=False, packed=False
+):
     """One FC1/FC2 stage. ``mma``: (TMEM accumulator, weight desc, activation desc);
     scales: (TMEM column, desc[, activation copy flag]); ``release``: (FC1 accumulate
-    or FC2 prior-H release, weight empty barrier); ``done``: accumulator barrier."""
+    or FC2 prior-H release, weight empty barrier); ``done``: accumulator barrier.
+    ``wide`` (experimental, default off): sm_107f dense K=64 MMAs (idesc bit 31) with
+    scale IDs 0 / 2, half as many instructions; only valid if the hardware applies one
+    scale per 32-block from consecutive bytes (checked against the FP64 reference).
+    ``chain2`` (planned engine, default off; FC1 only): odd K=32 MMAs accumulate into a
+    shadow accumulator 384 TMEM columns up, two independent accumulate chains; the
+    epilogue adds the two FP32 partials.
+    ``packed`` (TP16 fc1 / fc2, default off): the slot holds packed E2M1 weight rows
+    (128B-swizzled UINT8 boxes: FC1 128 B = K256, FC2 the 96 data bytes = K192) and the
+    MMAs are Rubin's dense K=64 ones (idesc bit 31) at A offset k (32 B per K64), with
+    scale IDs k % 4 in {0, 2}: two per-32 UE8M0 scales per row and column (bytes ID and
+    ID + 1). Same inputs and FP32 accumulator; the
+    MMA sums K64 instead of K32 groups (a reorder). Ported from the vendored
+    ``stage16(packed=True)`` (``..rubin.moe.experts_rubin``)."""
+    chain2 = chain2 and kind == "fc1"
+    assert not (chain2 and wide)
+    assert not packed or (kind in ("fc1", "fc2", "fc2a", "fc2b", "fc2p") and not wide and not chain2), kind
+    k64 = wide or packed
     half = kind in ("fc2b", "fc2p")
     steps = 6 if kind == "fc2" else 4 if half else 8
     cp = "tcgen05.cp.cta_group::1.32x128b.warpx4"
     arrive = "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64"
     code = [
-        "{ .reg .pred e,p0,pt,pc,pa,ph; .reg .b32 i<4>; .reg .b64 as1,bs1,bs2;",
+        "{ .reg .pred e,p0,pt,pc,pa,ph; .reg .b32 i<4>" + (",w<4>" if k64 else "") + (",d1" if chain2 else "")
+        + "; .reg .b64 as1,bs1,bs2;" + (" add.u32 d1,$0,384;" if chain2 else ""),
         f".reg .b32 af1,bf1,bf2; .reg .b64 xa<{steps}>,xb<{steps}>;",
         "elect.sync _|e,0xffffffff; setp.eq.b32 pt,0,0; setp.ne.b32 pc,$7,0;",
         "and.pred pc,pc,e; setp.ne.b32 pa,$10,0; and.pred pa,pa,e;",
@@ -245,13 +355,21 @@ def stage(mma, weight_scales, activation_scales, release, done, *, kind):
         code.append(f"@e {cp} [af1],as1;")
     for k in range(steps):
         a = k // 4 * 1024 + k % 4 * 2 + (4 if kind == "fc2" and k >= 4 else 0)
+        if packed:
+            a = k
         b = k // 4 * 64 + k % 4 * 2
         code.append(f"add.s64 xa{k},$1,{a}; add.s64 xb{k},$2,{b};")
-    for k in range(steps):
+    if k64:
+        assert packed or kind != "fc2"
+        code += [f"mov.b32 w{k},0x{142738048 | 1 << 31 | k << 29 | k << 4:08x};" for k in (0, 2)]
+    for k in range(0, steps, 2 if k64 else 1):
         af, bf = ("$3", "$5") if k < 4 else ("af1", "bf1")
+        desc = f"w{k % 4}" if k64 else f"i{k % 4}"
+        dst = "d1" if chain2 and k % 2 else "$0"
+        init = k == 0 or (chain2 and k == 1)
         code.append(
             "@e tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale "
-            f"[$0],xa{k},xb{k},i{k % 4},[{af}],[{bf}],{'p0' if k == 0 else 'pt'};"
+            f"[{dst}],xa{k},xb{k},{desc},[{af}],[{bf}],{'p0' if init else 'pt'};"
         )
     if kind != "fc2p":
         code.append(f"@e {arrive} [$9];")
@@ -264,11 +382,62 @@ def stage(mma, weight_scales, activation_scales, release, done, *, kind):
     return "\n".join(code), ",".join(kinds) + ",~{memory}", values
 
 
+@asm()
+def fence_proxy_async_global():
+    """K-16 consumer side: generic -> async proxy fence for global memory (PTX 9.7.15.4), issued by the
+    TMA-issuing thread after griddepcontrol.wait, before its TMA reads the predecessor's plan; ``planned`` has the same."""
+    return "fence.proxy.async.global;", "~{memory}", ()
+
+
+@asm()
+def load_tma3_keep(dst, descriptor, barrier, row, chunk):
+    """3-D TMA tile load without the evict-first hint (the x plan is read by every CTA); ``planned.load_tma3_keep``."""
+    code = "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier"
+    code += "::complete_tx::bytes [$0],[$1,{0,$3,$4}],[$2];"
+    return code, "r,l,r,r,r,~{memory}", (dst, descriptor, barrier, Int32(row), Int32(chunk))
+
+
 @asm(Uint32)
 def claim(pointer, value):
     """Relaxed GPU-scope fetch-add (FC2 tail claims): the counter before the add."""
     code = "atom.relaxed.gpu.global.add.u32 $0,[$1],$2;"
     return code, "=r,l,r,~{memory}", (pointer, Uint32(value))
+
+
+@asm()
+def store_u16_relaxed(pointer, value):
+    """``st.relaxed.gpu`` of 16 bits (K-17: the hidden image's two block scales of one (tile, token))."""
+    return "st.relaxed.gpu.global.u16 [$0], $1;", "l,h,~{memory}", (pointer, Uint16(value))
+
+
+@asm(Uint16)
+def load_u16_volatile(pointer):
+    """16-bit ``ld.volatile`` (K-17: hidden scale polls at the width the scales are stored at)."""
+    return "ld.volatile.global.u16 $0, [$1];", "=h,l,~{memory}", (pointer,)
+
+
+# ``ExpertsKernel.strong`` -> (strong hand-off stores, 16-bit hidden scales, lean scale form). True = K-17 in its
+# lean form: the strong edges, with block 1's scale computed once per thread outside the token
+# loop. "inloop_DEBUG" = the first form of the same edges (the scale computed inside the unrolled token loop:
+# compliant and bitwise, but measurably slower per call at B8); constructor-only reference for the cost study, never env-reachable.
+STRONG_MODES = {
+    False: (False, False, False),
+    True: (True, True, True),
+    "inloop_DEBUG": (True, True, False),
+}
+
+
+def strong_parts(kernel):
+    """(strong stores, 16-bit scales, lean scale form) of ``kernel.strong`` (weak for unbound callers, mkv2 W4A8)."""
+    return STRONG_MODES[getattr(kernel, "strong", False)]
+
+
+def handoff_scope(kernel):
+    """``K31MK_EXPERTS_STRONG_SYNC`` (``ExpertsKernel(strong=True)``; K-17): the intra-grid Lamport
+    hand-offs (hidden images, split-K partials, staged FC2 rows) and their 0xFFFFFFFF re-arms are stored with
+    ``st.relaxed.gpu`` at the width they are polled (morally strong with the ``ld.volatile`` polls, PTX 8.7),
+    instead of weak ``st.global``. Engines that call these methods unbound (mkv2 W4A8) default to the weak form."""
+    return "gpu" if strong_parts(kernel)[0] else None
 
 
 def fc2_pairs(tp, capacity, streamed):
@@ -284,7 +453,7 @@ class ExpertsKernel(ExpertsGeometry):
     cooperatively and ``PersistentExperts.prepare`` checks it is co-resident.
     ``publish`` stages FC2 rows for ``finalize``: routing weights replace the output
     arg, and (latent multicast, parity, rank) follow the SiTU scalars; ``"twoshot"``:
-    (receive slots [3 x TP, 64, 3584/TP], their owners' bases, parity x TP + rank) of
+    (receive slots [3 x TP, box_rows, 3584/TP], their owners' bases, parity x TP + rank) of
     ``common.twoshot`` instead. Capacity > 8 (grouped) takes the plan (``PLAN_BYTES``:
     MXFP8 x) in place of x. ``stream`` runs capacity <= 8 on the incremental producer
     and CTA-scoped waits (grouped always). ``pregrouped`` (grouped) reads the unit table
@@ -294,24 +463,91 @@ class ExpertsKernel(ExpertsGeometry):
     ``victims`` CTAs before it from the back, through one counter per CTA re-armed by
     call parity; a stolen grain is computed exactly as by its owner."""
 
+    # Rows per latent slot of the MoE tail box the publish modes write (``MoeTailBox.cap``): the multicast slot
+    # stride and the two-shot receive layout. The compile functions set it for boxes other than 64 rows.
+    box_rows = 64
+
     def __init__(
         self, tp, capacity, experts, grid, publish=False,
-        stream=True, pregrouped=False, steal=False,
+        stream=True, pregrouped=False, steal=False, activation_floor=None,
+        packed=False, packed_stages=6, situ_lean=False, strong=False, x3_release=False, producer_spin=0,
+        hfull_bar=False, xtma=False, packed_fc1=False, packed_fc2=False,
     ):  # fmt: skip
-        super().__init__(tp, capacity)
+        super().__init__(tp, capacity, packed, packed_stages, packed_fc1, packed_fc2)
+        self.situ_lean = situ_lean  # K31MK_EXP_SITU_LEAN: SiTU reciprocals once per thread (bitwise)
+        if strong not in STRONG_MODES:
+            raise ValueError(f"ExpertsKernel: strong={strong!r} not in {tuple(STRONG_MODES)}")
+        self.strong = strong  # K31MK_EXPERTS_STRONG_SYNC: strong hand-off stores (K-17; ``strong_parts``)
+        # ``xtma`` (K31MK_EXP_XPLAN, TP16 B8 only (prepare), default off): x arrives as the MXFP8 plan (PLAN_BYTES,
+        # written once per call by ``planned.EarlyPlanKernel`` or the routing kernel's copy role with the stock input
+        # rule) and tid 0 loads this CTA's whole SMEM x image (28 128-K atoms, 128B swizzle; rows >= batch zero-filled)
+        # and its scale words with two TMAs onto xready[0] right after the dependency wait (maps +256 / +384,
+        # ``experts_stream.plan_maps(atoms=28)``), instead of every CTA loading the FP32 latent and quantizing it.
+        # Same SMEM bytes, so the same MMAs.
+        self.xtma = xtma
+        assert xtma in (False, True), xtma
+        if xtma:
+            assert tp == 16 and not self.grouped, (tp, capacity)  # maps +256 / +384 are free only at TP16
+            assert self.off_x % 1024 == 0 and self.off_xsf % 128 == 0, (self.off_x, self.off_xsf)
+        self.activation_floor = (
+            tp == 8 if activation_floor is None else activation_floor
+        )
         self.pregrouped = pregrouped and self.grouped
         self.steal = steal and self.grouped
         self.streamed = stream or self.grouped
         self.paired = fc2_pairs(tp, capacity, self.streamed)
+        assert not self.packed_fc2 or self.paired, (tp, capacity)
         self.jobs = 14 if self.paired else 28  # FC2 jobs per unit
         self.grain, self.zone, self.victims = (1 if self.paired else 3, 8, 3)
         self.threads = 384
         self.capacity, self.experts, self.grid = (capacity, experts, grid)
         self.publish = publish
         assert not self.grouped or grid >= capacity <= 64
+        # CTAs [0, MAX_CTAS - grid) also advance entries [grid, MAX_CTAS) of the per-CTA
+        # counters (other grids share them), which covers them all only when 2 * grid
+        # reaches MAX_CTAS.
+        assert MAX_CTAS // 2 <= grid <= MAX_CTAS, (grid, MAX_CTAS)
         self.width = min(capacity, 8)
+        self.wide = False  # experimental K=64 MMAs (stage(wide=...)), planned engine only
+        self.chain2 = False  # two FC1 accumulate chains (stage(chain2=...)), planned engine only
         self.dense = capacity <= 4
         self.rounds = (112 * capacity + 319) // 320 if self.dense else 3
+        # ``x3_release`` (K31MK_EXPERTS_X3_RELEASE=2, default off): the compliant form of the
+        # inherited X3-WAR edge (K-10: the MMA warp's metadata read vs the producer's rewrite of the slot was
+        # ordered only by the stage's tcgen05.commit arrive). Every lane still reads the slot's metadata as shipped;
+        # after the stage's MMAs are issued the warp runs ``bar.sync 12, 32`` (PTX 8.9.4: the 32 lanes' reads happen
+        # before lane 0's next operation) and lane 0 arrives (mbarrier.arrive, .release.cta by default) on
+        # empty[slot], which counts 2 (that arrive + the commit). The producer's acquire wait on empty[slot] then
+        # orders its rewrite after every lane's read. TP16 streamed, unpaired, ungrouped, no steal, no publish.
+        # ``x3_release="meta"`` (K31MK_EXPERTS_X3_RELEASE=3, default off): the same bar.sync 12, 32
+        # after the MMA issue, but lane 0 arrives on a separate per-slot ``meta`` barrier (count 1, misc ``bar_meta``)
+        # that nothing else arrives on, and the producer waits on it (acquire) before it rewrites meta[slot];
+        # empty[slot] keeps count 1 (the stage's tcgen05.commit only) and still guards the slot's weight bytes.
+        if x3_release not in (False, "bar", "meta"):
+            raise ValueError(f"ExpertsKernel: x3_release={x3_release!r} not in (False, 'bar', 'meta')")
+        # ``hfull_bar`` (K31MK_EXPERTS_HFULL_BAR=1, default off): the hidden loader warp joins
+        # with ``bar.sync 13, 32`` (PTX 8.9.4) instead of bar.warp.sync after its 32 lanes' image stores + proxy
+        # fences, before lane 0's release arrive on hfull (count 1; lane 0's arrive is its only arrival).
+        if hfull_bar not in (False, True):
+            raise ValueError(f"ExpertsKernel: hfull_bar={hfull_bar!r} not a bool")
+        assert not (x3_release or hfull_bar) or (
+            tp == 16 and self.streamed and not self.grouped and not self.paired and not self.steal and not publish
+        ), (tp, self.streamed, self.grouped, self.paired, self.steal, publish)
+        self.x3_release = x3_release
+        self.x3_count2 = x3_release == "bar"  # a plain bool for the traced barrier-init loop (the DSL's ``and`` rejects str)
+        self.x3_meta = x3_release == "meta"
+        self.hfull_bar = hfull_bar
+        # meta barriers: the init loop's spare indices from 2 x stages + 50 (after xready) on; unpacked (5 slots) ends at
+        # misc 520 (off_meta), packed (meta at misc 4352) may use misc [520, 600) (accmeta starts at 600).
+        self.bar_meta = 8 * (2 * self.stages + 50)
+        self.meta_inits = 3 * self.stages + 50  # barrier indices [0, meta_inits) initialized when x3_meta
+        assert not self.x3_meta or self.bar_meta + 8 * self.stages <= (600 if packed else 520), (self.stages, packed)
+        # ``producer_spin`` (K31MK_EXPERTS_PRODUCER_PACE, default 0): after each weight stage's copies the
+        # producer lane spins that many SM clocks (clock64 loop; no memory or barrier operation, outputs bitwise). TP16
+        # streamed, unpaired, ungrouped; the runtime applies it to the packed K64 engine's B4-8 stream calls only.
+        self.producer_spin = int(producer_spin)
+        assert self.producer_spin >= 0 and (self.producer_spin == 0 or (
+            self.streamed and not self.grouped and not self.paired)), (producer_spin, self.streamed, self.grouped, self.paired)
 
     def sync(self, barrier, phase=0, tmem=False):
         """Parity wait (then tcgen05 ordering if ``tmem``). Every barrier here is
@@ -320,7 +556,7 @@ class ExpertsKernel(ExpertsGeometry):
         (wait_tmem if tmem else wait)(barrier, phase, scope=scope)
 
     @cute.jit
-    def route(self, sm, ids, counters, batch: Int32):
+    def route(self, sm, ids, counters, batch: Int32, workspace=None):
         """Dedupe after the dependency wait. Capacity <= 2: one work item per routing
         pair; else first occurrences across tokens in order, keeping token slots."""
         tid, warp, lane, cta = thread()
@@ -357,6 +593,7 @@ class ExpertsKernel(ExpertsGeometry):
                 )
             cute.arch.sync_threads()
             if tid < 128:
+                bar: cutlass.Constexpr = getattr(self, "route_bar", 1)  # W8 kwarg: routing's join ID
                 firstk = Int32(-1)
                 if tid < pairs:
                     firstk = table[myid]
@@ -364,7 +601,7 @@ class ExpertsKernel(ExpertsGeometry):
                 ballot = Uint32(cute.arch.vote_ballot_sync(first))
                 if lane == 0:
                     counts[warp] = Int32(cute.arch.popc(ballot))
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=bar, number_of_threads=128)
                 base = Int32(0)
                 for w in cutlass.range_constexpr(3):
                     if warp > w:
@@ -375,7 +612,7 @@ class ExpertsKernel(ExpertsGeometry):
                     expert[rank] = myid
                 if tid == 0:
                     distinct[0] = counts[0] + counts[1] + counts[2] + counts[3]
-                cute.arch.barrier(barrier_id=1, number_of_threads=128)
+                cute.arch.barrier(barrier_id=bar, number_of_threads=128)
                 if tid < pairs:
                     slots[uof[firstk] * 8 + tid // 16] = Int8(tid % 16)
         # Retire every thread's hash accesses before async weight-ring reuse.
@@ -457,9 +694,9 @@ class ExpertsKernel(ExpertsGeometry):
                 mine[k] = ids[tid + self.threads * k]
         if cutlass.const_expr(counted):
             if tid == 0:
-                scalars[1] = view(workspace.iterator, self.ws_counter, Int32, 160)[cta]
+                scalars[1] = view(workspace.iterator, self.ws_counter, Int32, MAX_CTAS)[cta]
             if tid == 1:
-                scalars[2] = view(workspace.iterator, self.ws_calls, Int32, 160)[cta]
+                scalars[2] = view(workspace.iterator, self.ws_calls, Int32, MAX_CTAS)[cta]
         for i in range(tid, 2 * self.experts, self.threads):
             masks[i] = Uint32(0)
         for i in range(tid, 4 * self.units, self.threads):
@@ -656,7 +893,7 @@ class ExpertsKernel(ExpertsGeometry):
             a, b = (tile, ks)
             opens = Int32((s == ranges[group, 2]) | (ks == 0))
             c = opens | Int32((s == ranges[group, 3] - 1) | (ks == 13)) << 1
-            row, chunk = (expert * self.w13_rows + r * 128, 2 * ks)
+            row, chunk = (expert * self.w13_rows + r * 128, ks if self.packed else 2 * ks)
             scale_offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
             scale_bytes = Int32(1024)
         else:
@@ -668,7 +905,7 @@ class ExpertsKernel(ExpertsGeometry):
             expert = experts[u]
             kind = Int32(1) if half == 0 else Int32(3)
             a, b = (u, tile)
-            row, chunk = (expert * 3584 + tile * 128, 2 * half)
+            row, chunk = (expert * 3584 + tile * 128, half if self.packed else 2 * half)
             scale_offset = Int64(expert) * self.w2_scale_bytes
             scale_offset += tile * self.w2_tile_scale_bytes
             scale_offset += half * 1024
@@ -697,7 +934,11 @@ class ExpertsKernel(ExpertsGeometry):
                 if 8 * atom + (position ^ token) < self.tiles * 4:
                     for w in cutlass.range_constexpr(4):
                         bad |= has_ff_byte(words[w])
-            scale = load_volatile(source + self.h_image_bytes + lane * 4)[0]
+            if cutlass.const_expr(strong_parts(self)[1]):
+                at = source + self.h_image_bytes + lane * 4  # two 16-bit polls: the width the scales are stored at
+                scale = Uint32(load_u16_volatile(at)) | Uint32(load_u16_volatile(at + 2)) << 16
+            else:
+                scale = load_volatile(source + self.h_image_bytes + lane * 4)[0]
             if valid_bytes > 0:
                 bad |= has_ff_byte(scale & mask)
             ready = cute.arch.vote_all_sync(not bad)
@@ -710,7 +951,10 @@ class ExpertsKernel(ExpertsGeometry):
             sf = sm.iterator + self.off_hsf + buffer * self.h_scale_bytes
             store_shared_words(sf + (lane >> 3) * 128 + (lane & 7) * 16, (word,) * 4)
         cute.arch.fence_proxy("async.shared", space="cta")
-        cute.arch.sync_warp()
+        if cutlass.const_expr(self.hfull_bar):  # cand-09b: a synchronizing join (PTX 8.9.4) before lane 0's hfull release
+            named_barrier(13, 32)
+        else:
+            cute.arch.sync_warp()
 
     @cute.jit
     def load_hidden(self, sm, workspace, ranges, parity):
@@ -838,7 +1082,7 @@ class ExpertsKernel(ExpertsGeometry):
         n, g = (self.jobs, self.grain)
         head = (ranges[0, 4], ranges[0, 5], 0)
         state = self.fc2_jobs(ring, state, maps, experts, ranges, *head)
-        counters = workspace.iterator + self.ws_steal + 640 * parity
+        counters = workspace.iterator + self.ws_steal + 4 * MAX_CTAS * parity
         lo, hi = (ranges[1, 4], ranges[1, 5])
         grains = (hi - lo) // g
         if grains > self.zone:
@@ -870,7 +1114,7 @@ class ExpertsKernel(ExpertsGeometry):
     @cute.jit
     def fetch(self, sm, desc, scales, full, slot, row, chunk, offset, size, more=None):
         """Weight box and scale bytes (``more``: a second ``size``-byte scale run)."""
-        load_tma3(sm.iterator + slot * 32768, desc, full.iterator + slot, row, chunk)
+        load_tma3(sm.iterator + slot * self.slot_bytes, desc, full.iterator + slot, row, chunk)
         dst = sm.iterator + self.off_sfa + slot * 1024
         copy_evict(dst, scales.iterator + offset, size, full.iterator + slot)
         if cutlass.const_expr(more is not None):
@@ -893,9 +1137,10 @@ class ExpertsKernel(ExpertsGeometry):
                 self.sync(empty, phase ^ 1)
             for i in cutlass.range_constexpr(4):
                 metadata[4 * slot + i] = meta[i]
-            cute.arch.mbarrier_arrive_and_expect_tx(
-                barriers.iterator + slot, 16384 + tma[3]
-            )
+            box = Int32(16384)
+            if cutlass.const_expr(self.packed):  # packed FC2: the 96 data bytes of 128 rows
+                box -= Int32(4096) * Int32(meta[0] != 0)
+            cute.arch.mbarrier_arrive_and_expect_tx(barriers.iterator + slot, box + tma[3])
             if meta[0] == 0:
                 self.fetch(sm, maps.iterator, w13_scales, barriers, slot, *tma)
             else:
@@ -912,7 +1157,7 @@ class ExpertsKernel(ExpertsGeometry):
         """Producer lane walking its FC1 then FC2 stages incrementally (no per-stage
         divisions; the expert is re-read only when the unit changes). Grouped expert
         tables are this CTA's windows; else they hold every distinct expert."""
-        tiles, w13, w2 = (self.tiles, maps.iterator, maps.iterator + 128)
+        tiles, w13, w2 = (self.tiles, maps.iterator + self.fc1_map, maps.iterator + 128)
         barriers = view(sm.iterator, self.off_misc, Uint64, 2 * self.stages)
         metadata = view(sm.iterator, self.off_meta, Int32, 4 * self.stages)
         ring = (sm, barriers, metadata, w2_scales)
@@ -929,7 +1174,7 @@ class ExpertsKernel(ExpertsGeometry):
                 c = Int32(opens) | Int32(closes) << 1
                 row = expert * self.w13_rows + r * 128
                 offset = Int64(expert) * self.w13_scale_bytes + r * 14336 + ks * 1024
-                tma = (w13, w13_scales, row, 2 * ks, offset, Int32(1024))
+                tma = (w13, w13_scales, row, ks if self.fc1_packed else 2 * ks, offset, Int32(1024))
                 slot, phase, issued = self.issue(
                     ring, slot, phase, issued, (Int32(0), tile, ks, c), tma, False
                 )
@@ -959,7 +1204,7 @@ class ExpertsKernel(ExpertsGeometry):
                         row = expert * 3584 + tile * 128
                         offset = Int64(expert) * self.w2_scale_bytes + half * 1024
                         offset += tile * self.w2_tile_scale_bytes
-                        tma = (w2, w2_scales, row, 2 * half, offset, Int32(size))
+                        tma = (w2, w2_scales, row, half if self.packed else 2 * half, offset, Int32(size))
                         meta = (Int32(1 if half == 0 else 3), unit, tile, Int32(0))
                         slot, phase, issued = self.issue(
                             ring, slot, phase, issued, meta, tma, True
@@ -970,6 +1215,9 @@ class ExpertsKernel(ExpertsGeometry):
                     expert = experts[index]
         if issued >= self.stages:
             self.sync(barriers.iterator + self.stages + slot, phase ^ 1)
+            if cutlass.const_expr(self.x3_meta):  # x3 meta: the end marker rewrites meta[slot] too
+                metabar = view(sm.iterator, self.off_misc + self.bar_meta, Uint64, self.stages)
+                self.sync(metabar.iterator + slot, phase ^ 1)
         for i in cutlass.range_constexpr(4):
             metadata[4 * slot + i] = Int32(2 if i == 0 else 0)
         arrivals = 33 if self.grouped else 1
@@ -979,14 +1227,14 @@ class ExpertsKernel(ExpertsGeometry):
     def fc2_pair(self, ring, slot, phase, issued, maps, expert, unit, tile):
         """The three 16 KB stages of FC2 tiles ``tile`` and ``tile + 1``: chunks 0-1 of
         each (1 KB scales), then chunk 2 of both (map 5, two 512 B scale runs)."""
-        w2, scales, step = (maps + 128, ring[3], self.w2_tile_scale_bytes)
+        w2, scales, step = (maps + self.fc2_map, ring[3], self.w2_tile_scale_bytes)
         row = expert * 3584 + tile * 128
         offset = Int64(expert) * self.w2_scale_bytes + tile * step
         for t in cutlass.range_constexpr(2):
             tma = (w2, scales, row + 128 * t, Int32(0), offset + t * step, Int32(1024))
             meta = (Int32(1), unit, tile + t, Int32(0))
             slot, phase, issued = self.issue(ring, slot, phase, issued, meta, tma, True)
-        tma = (maps + 640, scales, row, Int32(2), offset + 1024, Int32(512))
+        tma = (maps + self.fc2c_map, scales, row, Int32(self.fc2c_chunk), offset + 1024, Int32(512))
         meta = (Int32(3), unit, tile, Int32(0))
         more = offset + step + 1024
         return self.issue(ring, slot, phase, issued, meta, tma, True, more)
@@ -1003,12 +1251,21 @@ class ExpertsKernel(ExpertsGeometry):
         if issued >= self.stages:
             empty = barriers.iterator + self.stages + slot
             self.sync(empty, phase ^ 1)
+            if cutlass.const_expr(self.x3_meta):  # cand-09b: every MMA-warp lane's read of meta[slot] is done
+                metabar = view(sm.iterator, self.off_misc + self.bar_meta, Uint64, self.stages)
+                self.sync(metabar.iterator + slot, phase ^ 1)
         for i in cutlass.range_constexpr(4):
             metadata[4 * slot + i] = meta[i]
         full = barriers.iterator + slot
-        total = 16384 + size if more is None else 16384 + 2 * size
+        box = 12288 if self.packed and fc2 else 16384  # packed FC2: 96 data bytes x 128 rows
+        total = box + size if more is None else box + 2 * size
         cute.arch.mbarrier_arrive_and_expect_tx(full, total)
         self.fetch(sm, desc, scales, barriers, slot, row, chunk, offset, size, more)
+        if cutlass.const_expr(self.producer_spin > 0):  # producer pacer: delay the producer's next stage
+            spin_end = clock64() + Int64(self.producer_spin)
+            spin_now = clock64()
+            while spin_now < spin_end:
+                spin_now = clock64()
         if cutlass.const_expr(fc2 and self.grouped):
             cute.arch.mbarrier_arrive(full, arrive_count=32)
         slot += 1
@@ -1041,9 +1298,10 @@ class ExpertsKernel(ExpertsGeometry):
             stage, token, kblock, valid = self.ownership(index, batch)
             if valid:
                 source = x.iterator + token * 3584 + stage * 256 + kblock * 32
-                for fragment in cutlass.range_constexpr(4):
+                for fragment in cutlass.range_constexpr(raw.shape[1]):
+                    step: cutlass.Constexpr = 4 if x.element_type == Float32 else 8
                     words = load_words(
-                        source + fragment * 8, count=4, cache_policy="", mutable=True
+                        source + fragment * step, count=4, cache_policy="", mutable=True
                     )
                     for j in cutlass.range_constexpr(4):
                         raw[index, fragment, j] = words[j]
@@ -1055,7 +1313,13 @@ class ExpertsKernel(ExpertsGeometry):
         for index in cutlass.range_constexpr(self.rounds):
             stage, token, kblock, valid = self.ownership(index, batch)
             if valid:
-                packed, scale = mx_block([raw[index, i // 4, i % 4] for i in range(16)])
+                if cutlass.const_expr(raw.shape[1] == 8):
+                    values = cute.make_rmem_tensor(32, Float32)
+                    for i in cutlass.range_constexpr(32):
+                        values[i] = bits_float(raw[index, i // 4, i % 4])
+                    packed, scale = mx_values(values)
+                else:
+                    packed, scale = mx_block([raw[index, i // 4, i % 4] for i in range(16)])
                 for half, words in enumerate((packed[:4], packed[4:])):
                     offset = swizzled(16 * stage + 2 * kblock + half, token, self.off_x)
                     store_shared_words(sm.iterator + offset, words)
@@ -1102,6 +1366,9 @@ class ExpertsKernel(ExpertsGeometry):
             self.sync(*ready)
             kind, a, b, c = (meta[4 * slot + i] for i in range(4))
             if kind == 2:
+                if cutlass.const_expr(bool(self.xtma)):  # the x TMAs complete before the CTA can exit (9.7.10.28.1)
+                    if xmask == 0:
+                        self.sync(xready.iterator, 0, True)
                 if (lane == 0) & (current >= 0) & (hbuffer < 2):
                     commit(hempty.iterator + hbuffer)
                 for _ in cutlass.range(2, unroll=1):
@@ -1122,7 +1389,7 @@ class ExpertsKernel(ExpertsGeometry):
                         cute.arch.fence_proxy("async.shared", space="cta")
                         copy_scales = Uint32(1)
                     elif xmask >> b & 1 == 0:
-                        self.sync(xready.iterator + b, 0, True)
+                        self.sync(xready.iterator + (0 if self.xtma else b), 0, True)
                         xmask |= Uint32(1) << b
                         copy_scales = Uint32(1)
                     completion = Uint32(0)
@@ -1130,12 +1397,15 @@ class ExpertsKernel(ExpertsGeometry):
                         completion = shared_address(accfull.iterator + acc)
                     xi = slot if self.grouped else b
                     stage(
-                        (tmem + acc * 8, a0 + slot * 2048, x0 + xi * 128),
+                        (tmem + acc * 8, a0 + slot * (self.slot_bytes // 16), x0 + xi * 128),
                         (tmem + 128 + slot * 8, asf0 + slot * 64),
                         (tmem + 256 + xi * 8, xsf0 + xi * 16, copy_scales),
                         (Uint32(not first), shared_address(empty.iterator + slot)),
                         completion,
                         kind="fc1",
+                        wide=self.wide,
+                        chain2=self.chain2,
+                        packed=self.fc1_packed,
                     )
                     cute.arch.sync_warp()
                     publish = last
@@ -1169,6 +1439,8 @@ class ExpertsKernel(ExpertsGeometry):
                                 (release, released),
                                 0,
                                 kind="fc2a",
+                                wide=self.wide,
+                                packed=self.packed_fc2,
                             )
                         else:  # chunk 2 of tiles b (rows 0-127) and b + 1 (128-255)
                             for t in cutlass.range_constexpr(2):
@@ -1180,6 +1452,8 @@ class ExpertsKernel(ExpertsGeometry):
                                     (0, released),
                                     shared_address(accfull.iterator + acc),
                                     kind="fc2b" if t else "fc2p",
+                                    wide=self.wide,
+                                    packed=self.packed_fc2,
                                 )
                                 if cutlass.const_expr(t == 0):
                                     cute.arch.sync_warp()
@@ -1193,12 +1467,14 @@ class ExpertsKernel(ExpertsGeometry):
                         if tp16 or kind == 1:
                             self.acquire(accempty, acc, uses)
                             stage(
-                                (tmem + acc * 8, a0 + slot * 2048, hd),
+                                (tmem + acc * 8, a0 + slot * (self.slot_bytes // 16), hd),
                                 (tmem + 128 + slot * 8, asf0 + slot * 64),
                                 (sfbc, hs, copy_scales),
                                 (release, shared_address(empty.iterator + slot)),
                                 shared_address(accfull.iterator + acc) if tp16 else 0,
                                 kind="fc2" if tp16 else "fc2a",
+                                wide=self.wide,
+                                packed=self.packed,
                             )
                             publish = tp16
                         else:
@@ -1209,6 +1485,7 @@ class ExpertsKernel(ExpertsGeometry):
                                 (0, shared_address(empty.iterator + slot)),
                                 shared_address(accfull.iterator + acc),
                                 kind="fc2b",
+                                wide=self.wide,
                             )
                             publish = True
                             kind = Int32(1)
@@ -1217,6 +1494,15 @@ class ExpertsKernel(ExpertsGeometry):
                     self.signal(accmeta, accfull, acc, (kind, a, b, c))
                     uses += 1
                     acc = uses % 16
+                if cutlass.const_expr(self.x3_release == "bar"):  # x3 release: deferred X3 release, after the MMA issue
+                    named_barrier(12, 32)  # the 32 lanes' metadata reads happen before lane 0's release (PTX 8.9.4)
+                    if lane == 0:
+                        cute.arch.mbarrier_arrive(empty.iterator + slot)
+                if cutlass.const_expr(self.x3_meta):  # x3 meta: lane 0's release completes meta[slot]'s barrier alone
+                    named_barrier(12, 32)  # the 32 lanes' metadata reads happen before lane 0's release (PTX 8.9.4)
+                    if lane == 0:
+                        metabar = view(sm.iterator, self.off_misc + self.bar_meta, Uint64, stages)
+                        cute.arch.mbarrier_arrive(metabar.iterator + slot)
                 count += 1
 
     @cute.jit
@@ -1228,17 +1514,18 @@ class ExpertsKernel(ExpertsGeometry):
         group = Int32(tile >= self.tiles * ranges[1, 0])
         start = (tile - self.tiles * ranges[group, 0]) * 14
         owner = start >= ranges[group, 2]
+        scope = handoff_scope(self)
         if not owner:
-            offset = self.ws_partial + ((Int64(group) * 160 + cta) * 1024 + row) * 4
+            offset = self.ws_partial + ((Int64(group) * MAX_CTAS + cta) * 1024 + row) * 4
             for t in cutlass.range_constexpr(self.width):
                 if t < live:
-                    store_words(ws + offset + t * 512, (float_bits(values[t]),))
+                    store_words(ws + offset + t * 512, (float_bits(values[t]),), scope=scope)
         else:
             peer, size = (cta + 1, ranges[group, 1])
             while (peer < self.grid) & (peer * size // self.grid < start + 14):
                 if (peer + 1) * size // self.grid != peer * size // self.grid:
                     source = ws + self.ws_partial
-                    source += ((Int64(group) * 160 + peer) * 1024 + row) * 4
+                    source += ((Int64(group) * MAX_CTAS + peer) * 1024 + row) * 4
                     words = cute.make_rmem_tensor(self.width, Uint32)
                     ready = False
                     while not ready:
@@ -1252,7 +1539,7 @@ class ExpertsKernel(ExpertsGeometry):
                     for t in cutlass.range_constexpr(self.width):
                         if t < live:
                             values[t] += bits_float(words[t])
-                            store_words(source + t * 512, (Uint32(4294967295),))
+                            store_words(source + t * 512, (Uint32(4294967295),), scope=scope)
                 peer += 1
         return owner
 
@@ -1264,10 +1551,19 @@ class ExpertsKernel(ExpertsGeometry):
         up = lane & 8 == 0
         h, maxima = (cute.make_rmem_tensor(self.width, Float32) for _ in range(2))
         shared_max = view(sm.iterator, self.off_misc + 884, Float32, 64)
-        for t in cutlass.range_constexpr(self.width):
-            gate = cute.arch.shuffle_sync_bfly(values[t], 8)
-            h[t] = situ(gate, values[t], *scalars) if up else Float32(0)
-            maxima[t] = abs(h[t])
+        if cutlass.const_expr(self.situ_lean):
+            # Once per thread, not per token: the same MUFU.RCP of the same inputs (bitwise equal).
+            inv_beta, inv_lb = reciprocal(scalars[0]), reciprocal(scalars[1])
+            for t in cutlass.range_constexpr(self.width):
+                gate = cute.arch.shuffle_sync_bfly(values[t], 8)
+                h[t] = (routed_situ_hoisted(gate, values[t], scalars[0], scalars[1], inv_beta, inv_lb)
+                        if up else Float32(0))
+                maxima[t] = abs(h[t])
+        else:
+            for t in cutlass.range_constexpr(self.width):
+                gate = cute.arch.shuffle_sync_bfly(values[t], 8)
+                h[t] = situ(gate, values[t], *scalars) if up else Float32(0)
+                maxima[t] = abs(h[t])
         for t in cutlass.range_constexpr(self.width):
             for off in cutlass.range_constexpr(5):
                 other = cute.arch.shuffle_sync_bfly(maxima[t], 1 << off)
@@ -1275,12 +1571,30 @@ class ExpertsKernel(ExpertsGeometry):
             if lane == 0:
                 shared_max[(eg * 4 + ew) * 8 + t] = maxima[t]
         group_barrier(eg)
+        scope = handoff_scope(self)
+        _, scales16, lean = strong_parts(self)
         stage_base, scale_token = (self.off_misc + 3200 + (eg * 4 + ew) * 128, Int32(0))
+        scale_high = Int32(0)
+        if cutlass.const_expr(lean):
+            # Block 1's scale of token ``lane`` (the one ew 0 stores), once per thread before the token loop: the first form
+            # ("inloop_DEBUG") computed it under ``if lane == t`` inside the unrolled loop, which serialized the tokens
+            # (SASS: 8 BSSY regions, +181 instructions). Same fmax of warps 2 and 3's maxima in the same operand order
+            # (written before the group barrier above), so the same bits; lanes >= width keep 0 as before.
+            token = lane & (self.width - 1)
+            high_lean = cute.arch.fmax(shared_max[(eg * 4 + 2) * 8 + token], shared_max[(eg * 4 + 3) * 8 + token])
+            scale_high = hidden_exponent(high_lean, floor=self.activation_floor) if lane < self.width else Int32(0)
         for t in cutlass.range_constexpr(self.width):
             peer = shared_max[(eg * 4 + (ew ^ 1)) * 8 + t]
-            scale = mx_exponent(cute.arch.fmax(maxima[t], peer), floor=self.tp == 8)
+            scale = hidden_exponent(
+                cute.arch.fmax(maxima[t], peer), floor=self.activation_floor
+            )
             if lane == t:
                 scale_token = scale
+                if cutlass.const_expr(scales16 and not lean):
+                    if ew == 0:
+                        # Block 1's scale as warp ew 2 computes it: the same fmax of warps 2 and 3's maxima.
+                        high = cute.arch.fmax(shared_max[(eg * 4 + 2) * 8 + t], shared_max[(eg * 4 + 3) * 8 + t])
+                        scale_high = hidden_exponent(high, floor=self.activation_floor)
             if up:
                 bits = fp8_bits(h[t] * mx_rescale(scale))
                 sm[stage_base + t * 16 + 2 * (lane % 8) + lane // 16] = bits
@@ -1290,8 +1604,14 @@ class ExpertsKernel(ExpertsGeometry):
             if lane < self.width:
                 data = smem_words(sm.iterator + stage_base + lane * 16)
             image = self.image(workspace, parity, expert)
-            store_words(image + swizzled(kc, lane), data)
-            if ew & 1 == 0:
+            store_words(image + swizzled(kc, lane), data, scope=scope)
+            if cutlass.const_expr(scales16):
+                # One 16-bit store of the tile's two block scales per token (bytes 2 chunk, 2 chunk + 1), polled
+                # at 16 bits by ``poll_hidden``: no mixed-size race (PTX 8.7.2).
+                if ew == 0:
+                    pair = (Uint32(scale_token) & 255) | (Uint32(scale_high) & 255) << 8
+                    store_u16_relaxed(image + self.h_image_bytes + lane * 16 + 2 * chunk, Uint16(pair))
+            elif ew & 1 == 0:
                 byte = view(image, 0, Uint8, self.h_compact_bytes)
                 value = Uint8(scale_token)
                 byte[self.h_image_bytes + lane * 16 + 2 * chunk + ew // 2] = value
@@ -1321,7 +1641,7 @@ class ExpertsKernel(ExpertsGeometry):
                     row = self.pair(t, slot) * 1792 + tile * 64 + (warp & 3) * 16
                     stage = workspace.iterator + self.ws_stage + (row + 4 * q) * 4
                     if lane < 4:
-                        store_words(stage, words)
+                        store_words(stage, words, scope=handoff_scope(self))
                 elif lane & 8 == 0:
                     column = tile * 128 + (warp & 3) * 32 + 4 * (lane % 8) + lane // 8
                     dst = output.iterator + self.pair(t, slot) * 3584 + column
@@ -1348,7 +1668,7 @@ class ExpertsKernel(ExpertsGeometry):
                 ready = cute.arch.vote_all_sync(not bad)
             low, high = Float32(0), Float32(0)
             for slot in cutlass.range_constexpr(16):
-                store_words(source + slot * 7168, (Uint32(4294967295),))
+                store_words(source + slot * 7168, (Uint32(4294967295),), scope=handoff_scope(self))
                 weight = Float32(weights[token * 16 + slot])
                 low = fma(bf16(words[slot]), weight, low)
                 high = fma(bf16(words[slot], True), weight, high)
@@ -1359,7 +1679,7 @@ class ExpertsKernel(ExpertsGeometry):
                     push(*box, token, column + 8 * lane, packed)
                 else:
                     mc, parity, rank = box
-                    offset = ((parity * self.tp + rank) * 64 + token) * 3584 + column
+                    offset = ((parity * self.tp + rank) * self.box_rows + token) * 3584 + column
                     offset += 8 * lane
                     multicast_words(mc + Int64(offset) * 2, packed)
 
@@ -1381,6 +1701,11 @@ class ExpertsKernel(ExpertsGeometry):
                 values = cute.make_rmem_tensor(self.width, Float32)
                 for t in cutlass.range_constexpr(self.width):
                     values[t] = raw[t]
+                if cutlass.const_expr(self.chain2):
+                    if kind == 0:  # FC1: add the shadow accumulator's partial
+                        raw2 = load_tmem(tmem + (Uint32(32 * ew) << 16) + 384 + acc * 8, 8)
+                        for t in cutlass.range_constexpr(self.width):
+                            values[t] = values[t] + raw2[t]
                 fence_tmem(before=True)
                 cute.arch.sync_warp()
                 if lane == 0:
@@ -1408,12 +1733,15 @@ class ExpertsKernel(ExpertsGeometry):
         tmem_base = view(sm.iterator, self.off_misc + 856, Uint32, 1)
         if tid == 0:
             receive = range(528, 533) if self.capacity == 4 else ()
-            for i in (*range(65), *receive):
+            meta_extra = range(65, self.meta_inits) if self.x3_meta else ()  # x3 meta: meta barriers past index 64
+            for i in (*range(65), *meta_extra, *receive):
                 acc = 2 * self.stages
                 count = 1 if not acc <= i < acc + 32 else 2 if i < acc + 16 else 4
-                count = batch * 8 if acc + 36 <= i < acc + 50 else count
+                count = (1 if self.xtma else batch * 8) if acc + 36 <= i < acc + 50 else count
                 if self.grouped and i < self.stages:
                     count = 33
+                if self.x3_count2 and self.stages <= i < 2 * self.stages:  # x3 release: commit + lane-0 release arrive
+                    count = 2
                 cute.arch.mbarrier_init(barriers.iterator + i, count)
             if cutlass.const_expr(self.steal):
                 queue = view(sm.iterator, self.off_misc + self.bar_queue, Uint64, 16)
@@ -1424,10 +1752,18 @@ class ExpertsKernel(ExpertsGeometry):
             acquire_tensormap(maps.iterator + 128)
             if cutlass.const_expr(self.paired):
                 acquire_tensormap(maps.iterator + 640)
+            if cutlass.const_expr(self.packed_fc1):  # map 6: the packed w13 boxes
+                acquire_tensormap(maps.iterator + 768)
+            if cutlass.const_expr(self.packed_fc2):  # maps 7-8: the packed w2 boxes
+                acquire_tensormap(maps.iterator + 896)
+                acquire_tensormap(maps.iterator + 1024)
+            if cutlass.const_expr(self.xtma is True):
+                acquire_tensormap(maps.iterator + 256)
+                acquire_tensormap(maps.iterator + 384)
         if tid // 32 == 3:
             cute.arch.alloc_tmem(512, tmem_base.iterator)
             cute.arch.relinquish_tmem_alloc_permit()
-        if cutlass.const_expr(not self.grouped):
+        if cutlass.const_expr(not self.grouped and not self.xtma):  # xtma: the TMA zero-fills rows >= batch
             self.clear_x(sm, tid, batch)
         cute.arch.fence_proxy("async.shared", space="cta")
         return tmem_base
@@ -1444,25 +1780,36 @@ class ExpertsKernel(ExpertsGeometry):
             store_shared_words(xsf + (i >> 3) * 128 + (i & 7) * 16, zero)
 
     @cute.jit
+    def fetch_plan(self, sm, maps):
+        """``xtma`` (tid 0, after the dependency wait): the whole MXFP8 x image (28 atoms [8 rows][128 B], map +256)
+        and its scale words ([28][8 rows][16 B], map +384) onto xready[0]; the boxes are 8 rows deep, so rows >= batch
+        land as zeros (out of bounds), as ``clear_x`` leaves them in the shipped image."""
+        bar = view(sm.iterator, self.off_misc + self.bar_xready, Uint64, 14).iterator
+        fence_proxy_async_global()  # K-16: the plan is the predecessor grid's generic stores (after the wait)
+        cute.arch.mbarrier_arrive_and_expect_tx(bar, 28672 + 28 * 128)
+        load_tma3_keep(sm.iterator + self.off_x, maps.iterator + 256, bar, 0, 0)
+        load_tma3_keep(sm.iterator + self.off_xsf, maps.iterator + 384, bar, 0, 0)
+
+    @cute.jit
     def rearm(self, workspace, call_count):
         """Re-arm the other parity's images: all 128, or the last grouped call's."""
         _, _, lane, cta = thread()
         items: cutlass.Constexpr = 128 * self.h_compact_bytes // 16
         lo, hi = (cta * items // self.grid, (cta + 1) * items // self.grid)
         if cutlass.const_expr(self.grouped):
-            last = view(workspace.iterator, self.ws_calls + 640, Int32, 2)
+            last = view(workspace.iterator, self.ws_calls + 4 * MAX_CTAS, Int32, 2)
             used = max(last[call_count & 1 ^ 1], 0) * (self.h_compact_bytes // 16)
             lo, hi = (cta * used // self.grid, (cta + 1) * used // self.grid)
         other = self.image(workspace, call_count & 1 ^ 1, 0)
         for i in range(lo + lane, hi, 32):
-            store_words(other + i * 16, (Uint32(4294967295),) * 4)
+            store_words(other + i * 16, (Uint32(4294967295),) * 4, scope=handoff_scope(self))
         if cutlass.const_expr(self.steal):
-            # Every one of the 160 counters: grids change with the batch.
-            base = self.ws_steal + 640 * (call_count & 1 ^ 1)
-            counters = view(workspace.iterator, base, Int32, 160)
+            # Every one of the MAX_CTAS counters: grids change with the batch.
+            base = self.ws_steal + 4 * MAX_CTAS * (call_count & 1 ^ 1)
+            counters = view(workspace.iterator, base, Int32, MAX_CTAS)
             if lane == 0:
                 counters[cta] = Int32(-1)
-                if cta < 160 - self.grid:
+                if cta < MAX_CTAS - self.grid:
                     counters[self.grid + cta] = Int32(-1)
 
     @cute.kernel
@@ -1472,7 +1819,10 @@ class ExpertsKernel(ExpertsGeometry):
         sm = alloc(cutlass.utils.SmemAllocator(), Uint8, self.smem_bytes, 1024)
         tmem_base = self.initialize(sm, maps, batch)
         cute.arch.griddepcontrol_wait()
-        counters = view(workspace.iterator, self.ws_counter, Int32, 160)
+        if cutlass.const_expr(bool(self.xtma)):
+            if tid == 0:  # the thread that initialized xready[0]; the x TMAs overlap routing
+                self.fetch_plan(sm, maps)
+        counters = view(workspace.iterator, self.ws_counter, Int32, MAX_CTAS)
         if cutlass.const_expr(self.grouped):
             # Images and rearm alternate over grouped calls; ``x`` is the plan.
             routed = view(sm.iterator, self.off_misc + 1140, Int32, 3)
@@ -1489,10 +1839,13 @@ class ExpertsKernel(ExpertsGeometry):
         else:
             distinct, call_count, experts = self.route(sm, ids, counters, batch)
             generation = call_count
-            layout = cute.make_layout((self.rounds, 4, 4), stride=(16, 4, 1))
-            raw_x = cute.make_rmem_tensor(layout, Uint32)
-            if warp >= 2:
-                self.load_x(x, raw_x, batch)
+            if cutlass.const_expr(not self.xtma):
+                fragments: cutlass.Constexpr = 8 if x.element_type == Float32 else 4
+                layout = cute.make_layout((self.rounds, fragments, 4),
+                                          stride=(fragments * 4, 4, 1))
+                raw_x = cute.make_rmem_tensor(layout, Uint32)
+                if warp >= 2:
+                    self.load_x(x, raw_x, batch)
         fence_tmem()
         tmem = tmem_base[0]
         cute.arch.griddepcontrol_launch_dependents()
@@ -1507,7 +1860,7 @@ class ExpertsKernel(ExpertsGeometry):
                 else:
                     self.produce(*weights)
         else:
-            if cutlass.const_expr(not self.grouped):
+            if cutlass.const_expr(not self.grouped and not self.xtma):
                 ready = view(sm.iterator, self.off_misc + self.bar_xready, Uint64, 14)
                 if warp >= 2:
                     self.quantize_x(sm, raw_x, ready.iterator, batch)
@@ -1526,21 +1879,21 @@ class ExpertsKernel(ExpertsGeometry):
         release_tmem(tmem, 512, warp, 3)
         if tid == 0:
             counters[cta] = call_count + 1
-            if cta < 160 - self.grid:
+            if cta < MAX_CTAS - self.grid:
                 counters[self.grid + cta] = call_count + 1
             if cutlass.const_expr(self.grouped):
-                grouped = view(workspace.iterator, self.ws_calls, Int32, 162)
+                grouped = view(workspace.iterator, self.ws_calls, Int32, MAX_CTAS + 2)
                 grouped[cta] = generation + 1
-                if cta < 160 - self.grid:
+                if cta < MAX_CTAS - self.grid:
                     grouped[self.grid + cta] = generation + 1
                 if cta == 0:
-                    grouped[160 + (generation & 1)] = distinct
+                    grouped[MAX_CTAS + (generation & 1)] = distinct
 
 
 class ExpertsGroupKernel(ExpertsKernel):
     """One CTA groups the routes into the workspace unit table that pregrouped
     ``ExpertsKernel`` read (launched after routing, beside the shared expert). Every
-    experts call advances all 160 call counters, so entry 0 stands for each CTA's."""
+    experts call advances all MAX_CTAS call counters, so entry 0 stands for each CTA's."""
 
     def __init__(self, *args, early=False):
         super().__init__(*args)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fused shared expert for B>8: gate/up, SiTU, down and the routed tail's reduce-scatter
 push in one persistent tcgen05 kernel, synchronized by DSMEM and one global-memory
 barrier instead of kernel bounds.
@@ -47,7 +48,6 @@ from ..common.primitives import (
     pack_pair,
     push_float,
     release_tmem,
-    sigmoid,
     smem_desc,
     smem_words,
     split,
@@ -57,9 +57,8 @@ from ..common.primitives import (
     view,
     wait,
 )
-from ..gemm.ws_gemm import positive_zero, positive_zero32
+from ..gemm.ws_gemm import positive_zero32
 
-tanh = functools.partial(cute.math.tanh, fastmath=False)
 GRID, ROWS = 120, 112  # CTAs; CTAs with 64 down rows
 # With the MoE front rows: the K split by TP and a deeper ring that still fits beside
 # three o-proj consumer CTAs (<= 30 KB each; the kernel launches at the consumer's
@@ -68,18 +67,45 @@ FRONT_KS, FRONT_RING = {8: 4, 16: 6}, {8: 112 * 1024, 16: 96 * 1024}
 COUNTERS = 4  # h ready, exit
 
 
+@asm(Float32, pure=True)
+def situ_gate(gate, beta, inv_beta):
+    code = "{ .reg .f32 x,t,e,d,r; mul.ftz.f32 x,$1,$3; "
+    code += "tanh.approx.f32 t,x; mul.ftz.f32 t,$2,t; "
+    code += "mul.ftz.f32 x,$1,0fbfb8aa3b; ex2.approx.ftz.f32 e,x; "
+    code += "add.ftz.f32 d,e,0f3f800000; rcp.approx.ftz.f32 r,d; "
+    code += "mul.ftz.f32 $0,t,r; }"
+    return code, "=f,f,f,f", (gate, beta, inv_beta)
+
+
+@asm(Float32, pure=True)
+def situ_up(up, linear_beta, inverse):
+    code = "{ .reg .f32 x; mul.ftz.f32 x,$1,$3; "
+    code += "tanh.approx.f32 x,x; mul.ftz.f32 $0,$2,x; }"
+    return code, "=f,f,f,f", (up, linear_beta, inverse)
+
+
+@asm(Float32, pure=True)
+def situ_product(gate, up):
+    return "mul.ftz.f32 $0,$1,$2;", "=f,f,f", (gate, up)
+
+
 @cute.jit
-def situ(gate, up, beta, linear_beta, *, native: c.Constexpr = False):
-    if c.const_expr(native):
-        inv_beta, half = div_rn(c.Float32(1), beta), c.Float32(0.5)
-        g = half * beta * tanh(gate * inv_beta) * (c.Float32(1) + tanh(gate * half))
-        if linear_beta > 0:
-            up = linear_beta * tanh(up * div_rn(c.Float32(1), linear_beta))
-        return g * up
-    g = beta * tanh(div_rn(gate, beta)) * sigmoid(gate)
+def situ(gate, up, beta, linear_beta):
+    """Stock CUDA SiTU: FP32 fast tanh/exp/rcp, then one output conversion."""
+    g = situ_gate(gate, beta, div_rn(c.Float32(1), beta))
     if linear_beta > 0:
-        up = linear_beta * tanh(div_rn(up, linear_beta))
-    return g * up
+        up = situ_up(up, linear_beta, div_rn(c.Float32(1), linear_beta))
+    return situ_product(g, up)
+
+
+@cute.jit
+def situ_hoisted(gate, up, beta, linear_beta, inv_beta, inv_lb):
+    """``situ`` with ``inv_beta`` = div_rn(1, beta) and ``inv_lb`` = div_rn(1, linear_beta) computed once by the
+    caller (the same IEEE division of the same operands: bitwise equal to ``situ``)."""
+    g = situ_gate(gate, beta, inv_beta)
+    if linear_beta > 0:
+        up = situ_up(up, linear_beta, inv_lb)
+    return situ_product(g, up)
 
 
 @asm()
@@ -111,17 +137,18 @@ def wait_count(address, target):
         seen = Int32(acquire_count(address))
 
 
-def weight_maps(gate_up, down, front=None):
+def weight_maps(gate_up, down, front=None, down_rows=32):
     """TMA maps (W [64, 32] boxes, 128B swizzle) of gate/up, down, then (optional) the
-    MoE front GEMM's packed router / latent rows."""
+    MoE front GEMM's packed router / latent rows. ``down_rows=64``: the down map takes
+    [64, 64] boxes (``SharedDown`` with ``one64`` only)."""
     dtype = cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
     swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
     l2 = cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B
     weights = (gate_up, down) if front is None else (gate_up, down, front)
     specs = [
         (w.data_ptr(), dtype, (w.shape[1], w.shape[0]), (2 * w.stride(0),))
-        + ((64, 32), swizzle, l2)
-        for w in weights
+        + ((64, down_rows if i == 1 else 32), swizzle, l2)
+        for i, w in enumerate(weights)
     ]
     return tensor_maps(specs, gate_up.device)
 
@@ -515,8 +542,9 @@ class SharedUmma(SharedBase):
     def publish(self, args, parts, rows, f, rank):
         """Owner of front tile ``f``: sums each (row, token) in rank order, then
         publishes ``width``-row vectors like the front GEMM: FP32 router logits (rows
-        < valid) and BF16 latent columns (rows >= split), -0 made +0, as multicast
-        stores into the front mailbox (``mc``; this rank's ``slot`` / ``base``)."""
+        < valid) and FP32 latent columns (rows >= split; every TP, as stock's FP32
+        front, A4), -0 made +0, as multicast stores into the front mailbox (``mc``;
+        this rank's ``slot`` / ``base``)."""
         mc, slot, base = args[10:13]
         _, split, valid, pitch = self.front
         tid, _, _, _ = thread()
@@ -540,32 +568,37 @@ class SharedUmma(SharedBase):
             if row < valid:
                 for v in c.range_constexpr(width // 4):
                     words = tuple(positive_zero32(values[4 * v + i]) for i in range(4))
-                    offset = t * pitch + 3584 + 2 * (slot + row + 4 * v)
-                    multicast_words(mc + Int64(offset) * 2, words, kind="bf16x2")
+                    offset = t * pitch + 7168 + 2 * (slot + row + 4 * v)
+                    multicast_words(mc + Int64(offset) * 2, words, kind="f32")
             elif (row >= split) & (row - split < shard):
-                pairs = range(0, width, 2)
-                words = tuple(positive_zero(values[i], values[i + 1]) for i in pairs)
-                offset = t * pitch + base + row - split
-                multicast_words(mc + Int64(offset) * 2, words, kind="bf16x2")
+                for v in c.range_constexpr(width // 4):
+                    words = tuple(positive_zero32(values[4 * v + i]) for i in range(4))
+                    offset = t * pitch + 2 * (base + row - split + 4 * v)
+                    multicast_words(mc + Int64(offset) * 2, words, kind="f32")
 
 
 class SharedDown(SharedBase):
-    """The split variant's down projection beside the routed experts: ``sms``
-    persistent CTAs (one per SM the experts' grid leaves) stage h [N, hidden] once,
-    take every ``sms``-th 64-row tile, stream its W blocks through a TMA ring (warp 5)
+    """The split variant's down projection beside the routed experts: ``ctas``
+    CTAs stage h [N, hidden] once, take every ``ctas``-th 64-row tile,
+    stream its W blocks through a TMA ring (warp 5)
     into alternating TMEM accumulators (warp 4) and peer-store each tile like the
-    fused kernel (warps 0-3). Exactly the fused kernel's down numerics."""
+    fused kernel (warps 0-3). Exactly the fused kernel's down numerics.
 
-    def __init__(self, tp, batch, sms, budget=200 * 1024):
+    ``one64`` (``K31MK_MOE_SHARED_DOWN_ONE64``, default off): each 8 KB W stage is ONE
+    [64, 64] TMA box (``weight_maps(..., down_rows=64)``) instead of two [64, 32] boxes:
+    the same 128B-swizzled SMEM bytes with half the requests (bitwise identical)."""
+
+    def __init__(self, tp, batch, ctas, budget=200 * 1024, one64=False):
         super().__init__(tp, batch)
-        self.sms, self.image = sms, self.down * self.n * 128  # h as B tiles
+        self.one64 = one64
+        self.ctas, self.image = ctas, self.down * self.n * 128  # h as B tiles
         ring = budget - self.image - self.n * 68 * 4
         self.stages = min(24, ring // 8192)  # W [64, 64] K blocks (8 KB)
 
     @cute.jit
     def __call__(self, *args):
         options = dict(pdl=False, min_blocks_per_mp=1)
-        launch(self.kernel, args, self.sms, 192, **options)
+        launch(self.kernel, args, self.ctas, 192, **options)
 
     @cute.kernel
     def kernel(self, args):
@@ -596,7 +629,7 @@ class SharedDown(SharedBase):
         cute.arch.sync_threads()
         fence_tmem()
         tmem = slot[0]
-        tiles = (ROWS - cta + self.sms - 1) // self.sms
+        tiles = (ROWS - cta + self.ctas - 1) // self.ctas
         if warp < 4:
             for j in c.range_constexpr(self.down):
                 self.load_rows(image + j * self.n * 128, h, 64 * j)
@@ -606,22 +639,26 @@ class SharedDown(SharedBase):
                 fence_tmem()
                 values = self.accumulated(tmem + Uint32(i % 2 * columns))
                 cute.arch.mbarrier_arrive(acc_empty + i % 2)
-                self.push(args[2:6], staging, values, 64 * (cta + i * self.sms))
+                self.push(args[2:6], staging, values, 64 * (cta + i * self.ctas))
         elif warp == 4:
             self.multiply(image, ring, bars, tmem, tiles)
         elif lane == 0:
             down = maps.iterator + 128
             acquire_tensormap(down)  # in the thread that issues its TMAs
             for i in c.range(tiles, unroll=1):
-                row0 = 64 * (cta + i * self.sms)
+                row0 = 64 * (cta + i * self.ctas)
                 for j in c.range(self.down, unroll=1):
                     g = i * self.down + j
                     s = g % stages
                     if g >= stages:
                         wait(bars + stages + s, (g // stages - 1) % 2, scope="cta")
-                    self.load_weight(
-                        ring + s * 8192, down, bars + s, row0, row0 + 32, 64 * j
-                    )
+                    if c.const_expr(self.one64):  # one [64, 64] box, same SMEM image
+                        cute.arch.mbarrier_arrive_and_expect_tx(bars + s, 8192)
+                        load_tma2(ring + s * 8192, down, bars + s, 64 * j, row0)
+                    else:
+                        self.load_weight(
+                            ring + s * 8192, down, bars + s, row0, row0 + 32, 64 * j
+                        )
         release_tmem(tmem, 2 * columns, warp, 4)
 
     @cute.jit
@@ -670,15 +707,322 @@ def compile_shared(tp, batch, device, gate=False, front=None):
 
 
 @functools.cache
-def compile_down(tp, batch, device, sms):
-    """Arguments: h, ``weight_maps``, RS peers, parity, rank, capacity."""
+def compile_down(tp, batch, device, sms, *, ctas=None, budget=None, one64=False):
+    """Arguments: h, ``weight_maps``, RS peers, parity, rank, capacity.
+
+    ``sms`` is the caller's reservation beside the routed experts; ``ctas`` and
+    ``budget`` independently select the down grid and per-CTA shared storage.
+    ``one64``: one [64, 64] box per W stage (needs ``weight_maps(..., down_rows=64)``).
+    """
     args: tuple = (fake((batch, 6144 // tp)), fake((256,), None, c.Uint8, 64))
     args += (fake((tp,), None, Int64), Int32(0), Int32(0), Int32(0))
-    kernel = SharedDown(tp, batch, sms)
+    # Each output tile can leave the queue as soon as an expert SM becomes free.
+    # A few persistent CTAs cannot expand after the routed grid has drained.
+    wide = tp == 8 and 13 <= batch <= 24
+    if ctas is None:
+        ctas = ROWS if wide else sms
+    if budget is None:
+        budget = ((64 if batch <= 16 else 96) if wide else 200) * 1024
+    kernel = SharedDown(tp, batch, ctas, budget, one64)
     with torch.accelerator.device_index(device):
         return cute.compile(kernel, *args, make_fake_stream())
+
+
+def shared_down_one64_enabled():
+    """``K31MK_MOE_SHARED_DOWN_ONE64=1`` (default off): the split ``SharedDown`` loads each
+    8 KB W stage as one [64, 64] TMA box instead of two [64, 32] boxes (same SMEM bytes, bitwise identical output;
+    measured faster than the served kernel at 16-64 rows, isolated)."""
+    import os
+
+    return os.environ.get("K31MK_MOE_SHARED_DOWN_ONE64", "0") == "1"
 
 
 def scratch(device):
     """Model-owned fused shared-expert counters (zeroed; re-armed by each launch)."""
     return torch.zeros(COUNTERS, dtype=torch.int32, device=device)
+
+
+# ------------------------------------------------------------------------------ SiTU in the gate/up split-K
+def shared_sks_enabled():
+    """``K31MK_EXP_SHARED_SKS=1`` (default off): B<=8 verify batches run the shared expert's gate/up as
+    ``SplitKSituGemm`` (the shipped split-K GEMM and tactic, SiTU in the owner rank's epilogue, h BF16 out) instead of
+    the gate/up GEMM (FP32 out) followed by RouteSitu's situ role. Same FP32 sums in the same order, same SiTU."""
+    import os
+
+    return os.environ.get("K31MK_EXP_SHARED_SKS", "0") == "1"
+
+
+def shared_sks_k23_arm():
+    """K-23h (always on): SKS's owner arms bar_reduce at .relaxed.cluster."""
+    return True
+
+
+def interleave_gate_up(gate_up, tile=64):
+    """Load-time row relayout (lossless; ``deinterleave_gate_up`` inverts it): [gate (H rows); up (H rows)] ->
+    tile-interleaved [gate rows 32m..32m+31; up rows 32m..32m+31] per 64-row tile m, so one split-K M tile holds the
+    gate and up rows of the same 32 intermediate columns."""
+    rows = gate_up.shape[0]
+    half, pair = rows // 2, tile // 2
+    if rows % tile or half % pair:
+        raise ValueError(f"interleave_gate_up: {rows} rows do not split into {tile}-row tiles")
+    order = torch.arange(rows, device=gate_up.device).view(2, half // pair, pair).transpose(0, 1).reshape(-1)
+    return gate_up.index_select(0, order).contiguous(), order
+
+
+def deinterleave_gate_up(interleaved, order):
+    out = torch.empty_like(interleaved)
+    out[order] = interleaved
+    return out
+
+
+def _sks_classes():
+    """Built on first use: the vendored split-K engine imports FlashInfer names."""
+    import cutlass
+    import cutlass.utils as utils
+    import cutlass.utils.blackwell_helpers as sm100_utils
+    from cutlass.cute import experimental as cute_ext
+
+    from cutlass.cutlass_dsl import dsl_user_op
+
+    from ..gemm import splitk as SK
+
+    @dsl_user_op
+    def arm_cluster(mbar, tx_bytes, *, loc=None, ip=None):
+        """K-23h fix (K-23h / K-23b): the owner arms bar_reduce after the cluster barrier, so
+        peers' remote ``st.async`` complete_tx can land first; armed at CLUSTER scope the arm and those complete_tx are
+        morally strong (PTX 8.7) and the owner's ``try_wait.acquire.cluster`` orders the peers' partials whichever order
+        they take (litmus-tested: forbidden with the .relaxed.cluster arm). Same instruction as SplitKGemm's K-23b arm."""
+        code = "{ .reg .b64 st; mbarrier.arrive.expect_tx.relaxed.cluster.shared::cta.b64 st, [$0], $1; }"
+        SK._asm(code, "r,r,~{memory}", [mbar.toint().ir_value(), Int32(tx_bytes).ir_value()], loc, ip)
+
+    class SplitKSituGemm(SK.SplitKGemm):
+        """``SplitKGemm`` whose owner rank, after the in-order peer reduction, stages its FP32 sums in SMEM, pairs
+        tile rows j (gate) and 32 + j (up) of the interleaved weight, applies ``situ`` and stores h BF16 [B, H] at
+        column 32 * (M tile) + j. Requires mma_m == 64 and the ``interleave_gate_up`` weight."""
+
+        def __init__(self, *, tactic, epiwait=True, k23_arm=True):
+            super().__init__(tactic=tactic)
+            assert self.cta_m == 64, self.cta_m
+            # Every epilogue thread executes griddepcontrol.wait before it
+            # stores h, so its h writes are ordered after this grid's prerequisite grids (PTX 9.7.15.14 .wait applies to
+            # the executing thread); before, only the activation warp waited and the h writers were linked to it only
+            # through tcgen05.commit. epiwait=False is the old form (not selectable).
+            self.epiwait = epiwait
+            self.k23_arm = k23_arm  # K-23h: the owner's late bar_reduce arm at cluster scope (shared_sks_k23_arm)
+
+        @cute.experimental.jit
+        def __call__(self, a, b, c, h, a_map, beta, linear_beta, stream):
+            self.kernel(a, b, c, h, a_map, beta, linear_beta).launch(
+                grid=(
+                    cute.ceil_div(c.layout.shape[0], self.cta_m),
+                    cute.ceil_div(c.layout.shape[1], self.cta_n) * self.split_k,
+                    c.layout.shape[2],
+                ),
+                block=(self.threads_per_cta, 1, 1),
+                cluster=self.cluster_shape,
+                smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+                stream=stream,
+                use_pdl=True,
+            )
+
+        @cute.experimental.kernel
+        def kernel(self, mA, mB, mC, mH, a_map, beta, linear_beta):
+            """As ``SplitKGemm.kernel``; ``mC`` only shapes the grid and tiles (never written), ``mH`` (H, N, L)
+            receives h."""
+            stages = self.num_ab_stage
+            ab_dtype = mA.element_type
+            majors = (utils.LayoutEnum.from_tensor(t).mma_major_mode() for t in (mA, mB))
+            tiled_mma = sm100_utils.make_trivial_tiled_mma(
+                ab_dtype, ab_dtype, *majors, self.acc_dtype, self.cta_group, self.mma_tiler_mn,
+            )
+            mnk_tiler = (self.mma_tiler_mn[0], self.mma_tiler_mn[1], self.cta_k)
+            block_idx = cute.arch.block_idx()
+            bidx = block_idx[0]
+            split_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            n_idx = block_idx[1] // self.split_k
+            l_idx = block_idx[2]
+            warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+            shape = (tiled_mma, mnk_tiler, ab_dtype, stages)
+            sA = SK._smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_a(*shape))
+            sB = SK._smem(ab_dtype, None, 1024, sm100_utils.make_smem_layout_b(*shape))
+            acc_layout = cute_ext.make_tmem_layout_acc(tiled_mma, self.mma_tiler_mn, acc_stage=1)
+            bar_full = SK._smem(cutlass.Int64, stages, 8).iterator
+            bar_empty = SK._smem(cutlass.Int64, stages, 8).iterator
+            bar_tma_epilog = SK._smem(cutlass.Int64, 1, 8).iterator
+            bar_mma_epilog = SK._smem(cutlass.Int64, 1, 8).iterator
+            bar_tmem_alloc = SK._smem(cutlass.Int64, 1, 8).iterator
+            tmem_base_ptr = SK._smem(cutlass.Int32, 1, 4).iterator
+            staging = SK._smem(cutlass.Float32, self.cta_m * self.cta_n, 16)
+            mailbox, bar_reduce = sA, bar_mma_epilog
+            if cutlass.const_expr(self.split_k > 1):
+                mailbox = SK._smem(cutlass.Float32, self.mailbox_elements, 128)
+                bar_reduce = SK._smem(cutlass.Int64, 1, 8).iterator
+            if warp_idx == 0:
+                with cute.arch.elect_one():
+                    for i in range(stages):
+                        cute.arch.mbarrier_init(bar_full + i, 2)
+                        cute.arch.mbarrier_init(bar_empty + i, 1)
+                    cute.arch.mbarrier_init(bar_tma_epilog, 32)
+                    cute.arch.mbarrier_init(bar_mma_epilog, 1)
+                    cute.arch.mbarrier_init(bar_tmem_alloc, 160)
+                    if cutlass.const_expr(self.split_k > 1):
+                        cute.arch.mbarrier_init(bar_reduce, 1)
+            cute.arch.mbarrier_init_fence()
+            if cutlass.const_expr(self.split_k > 1):
+                cute.arch.cluster_arrive_relaxed()
+            else:
+                cute.arch.barrier()
+            k_tile_count = cute.size(mA, mode=[1]) // self.cta_k // self.split_k
+            k_tile_start = split_rank * k_tile_count
+            if cutlass.const_expr(self.split_k > 1):
+                cute.arch.cluster_wait()
+            tiles = (k_tile_start, k_tile_count)
+            if warp_idx == 0:
+                self.weight_warp(bar_full, bar_empty, sA, a_map, bidx * self.cta_m, *tiles)
+            elif warp_idx == 1:
+                b_tile = cute.local_tile(mB, (self.cta_n, self.cta_k), (n_idx, None, l_idx))
+                b_map = cute_ext.get_cta_v_map_ab(mB, mnk_tiler, tiled_mma, "B")
+                self.activation_warp(bar_full, bar_empty, b_tile, sB, b_map, *tiles)
+            elif warp_idx == 2:
+                k_blocks = self.cta_k // cute.size(tiled_mma.shape_mnk, mode=[2])
+                self.mma_warp(
+                    bar_full, bar_empty, bar_mma_epilog, bar_tmem_alloc, tiled_mma, sA, sB,
+                    tmem_base_ptr, acc_layout, k_blocks, k_tile_count,
+                )
+            elif warp_idx >= 4:
+                tile = cute.local_tile(mC, (self.cta_m, self.cta_n), (bidx, n_idx, l_idx))
+                self.situ_epilog(
+                    bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, tile,
+                    cute.arch.thread_idx()[0] - 128, mC.element_type, utils.LayoutEnum.from_tensor(mC),
+                    mailbox, bar_reduce, split_rank, staging, mH, bidx, n_idx, l_idx, beta, linear_beta,
+                )
+
+        @cute.experimental.jit
+        def situ_epilog(
+            self, bar_mma_epilog, bar_tmem_alloc, tmem_base_ptr, acc_layout, gD_tile, epi_tid, c_dtype, d_layout,
+            mailbox, bar_reduce, split_rank, staging, mH, bidx, n_idx, l_idx, beta, linear_beta,
+        ):
+            if cutlass.const_expr(self.epiwait):
+                cute.arch.griddepcontrol_wait()
+            cute.arch.mbarrier_arrive(bar_tmem_alloc)
+            cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+            SK._fence_tcgen05()
+            acc_view = cute.make_tensor(
+                cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr), acc_layout,
+            )[((None, None), 0, 0, 0)]
+            epi_tile = (self.cta_m, self.cta_n)
+            load_op = sm100_utils.get_tmem_load_op(
+                (self.cta_m, self.cta_n, self.cta_k), d_layout, c_dtype, self.acc_dtype, epi_tile, False,
+            )
+            tiled_copy_t2r = cute.nvgpu.tcgen05.make_tmem_copy(load_op, acc_view)
+            gD_epi = cute.flat_divide(gD_tile, epi_tile)
+            rmem_layout = cute_ext.make_t2r_rmem_layout(tiled_copy_t2r, gD_epi, epi_tid)
+            rAcc = cute_ext.allocate(self.acc_dtype, cute.AddressSpace.rmem, rmem_layout, alignment=32)
+            thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
+            cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+            SK._fence_tcgen05()
+            cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
+            cute.arch.fence_view_async_tmem_load()
+            SK._fence_tcgen05(before=True)
+            cute.arch.mbarrier_arrive(bar_tmem_alloc)
+            if cutlass.const_expr(self.split_k > 1):
+                vpt = cutlass.const_expr(cute.size(rmem_layout))
+                vpp = cutlass.const_expr(self.epilog_threads * vpt)
+                if split_rank != SK.OWNER_RANK:
+                    for i in cutlass.range_constexpr(0, vpt, 4):
+                        words = (rAcc[i], rAcc[i + 1], rAcc[i + 2], rAcc[i + 3])
+                        slot = mailbox.iterator + (split_rank - Int32(1)) * vpp
+                        slot = slot + epi_tid * vpt + i
+                        SK._store_shared_remote_v4(*words, slot, bar_reduce, Int32(SK.OWNER_RANK))
+                else:
+                    if epi_tid == 0:
+                        if cutlass.const_expr(self.k23_arm):
+                            arm_cluster(bar_reduce, self.expected_transaction_bytes)
+                        else:
+                            cute.arch.mbarrier_arrive_and_expect_tx(bar_reduce, self.expected_transaction_bytes)
+                    SK._wait_cluster(bar_reduce, Int32(0))
+                    for peer in cutlass.range_constexpr(self.split_k - 1):
+                        for i in cutlass.range_constexpr(vpt):
+                            rAcc[i] = rAcc[i] + mailbox[peer * vpp + epi_tid * vpt + i]
+            if split_rank == SK.OWNER_RANK:
+                # FP32 sums -> SMEM [tile row, token] (column-major tile, as gD's (M, N) coordinates).
+                sD = cute.make_tensor(staging.iterator, cute.make_layout((self.cta_m, self.cta_n), stride=(1, self.cta_m)))
+                cute_ext.partition_and_copy(thr_t2r, rAcc, sD)
+                cute.arch.barrier(barrier_id=1, number_of_threads=self.epilog_threads)
+                tokens = mH.layout.shape[1]
+                items: cutlass.Constexpr = 32 * self.cta_n
+                for r in cutlass.range_constexpr((items + self.epilog_threads - 1) // self.epilog_threads):
+                    item = epi_tid + r * self.epilog_threads
+                    j, t = item % 32, item // 32
+                    token = n_idx * self.cta_n + t
+                    if item < items and token < tokens:
+                        value = situ(sD[j, t], sD[32 + j, t], beta, linear_beta)
+                        mH[(bidx * 32 + j, token, l_idx)] = c.BFloat16(value)
+
+    return SplitKSituGemm
+
+
+@functools.cache
+def compile_sks(tactic, arch, epiwait=True, k23_arm=True):
+    """Code-only cache of ``SplitKSituGemm`` for a split-K tactic (mma_m 64)."""
+    import cutlass
+    from cutlass.cute.runtime import make_fake_tensor
+
+    from ..gemm.splitk import SplitKTactic
+
+    def fake3(leading, dtype=cutlass.BFloat16):
+        shape = tuple(cute.sym_int() for _ in range(3))
+        stride = (1, cute.sym_int(64), 0) if leading == 0 else (cute.sym_int(64), 1, 0)
+        return make_fake_tensor(dtype, shape, stride, assumed_align=16)
+
+    kernel = _sks_classes()(tactic=SplitKTactic(*tactic), epiwait=epiwait, k23_arm=k23_arm)
+    args = (fake3(1), fake3(1), fake3(0, cutlass.Float32), fake3(0), cutlass.Int64(0), Float32(4), Float32(25))
+    return cute.experimental.compile(kernel, *args, make_fake_stream(), options=f"--gpu-arch={arch}")
+
+
+class SharedSitu:
+    """The B<=8 shared expert's gate/up + SiTU as one split-K kernel (``K31MK_EXP_SHARED_SKS``). Owns the interleaved
+    copy of the gate/up weight (``interleave_gate_up``; checked to invert bitwise at construction)."""
+
+    def __init__(self, gate_up, policies, beta, linear_beta):
+        from ..common.host import architecture
+        from ..gemm import projection as PJ
+
+        self.weight, self.order = interleave_gate_up(gate_up)
+        if not torch.equal(deinterleave_gate_up(self.weight, self.order), gate_up):
+            raise RuntimeError("interleave_gate_up: the relayout does not invert bitwise")
+        self.hidden = gate_up.shape[0] // 2
+        # INT-F3: no module object on the instance. providers._owned_resource_inventory walks every attribute of the
+        # resource set; a module here led it through sys.modules into transformers' lazy auto mappings (Run F boot).
+        self.device = gate_up.device
+        self.scalars = (Float32(beta), Float32(linear_beta))
+        arch = architecture(self.device)
+        self.kernels, self.maps, self.extra = {}, {}, {}
+        self.epiwait = True  # SKS's epilogue threads run griddepcontrol.wait (engagement record)
+        self.k23_arm = shared_sks_k23_arm()  # engagement record (K-23h)
+        with torch.accelerator.device_index(self.device.index):
+            for batch, tactic in dict(policies).items():
+                if tactic[0] != 64:
+                    raise ValueError(f"SharedSitu needs 64-row M tiles, got tactic {tactic} at B{batch}")
+                self.kernels[batch] = compile_sks(tuple(tactic), arch, self.epiwait, self.k23_arm)
+                if 64 not in self.maps:
+                    self.maps[64] = PJ.weight_map(self.weight, 64)
+        self.weight_view = PJ.matrix_view(self.weight)
+        self.batches = frozenset(self.kernels)
+
+    def run(self, x, hg, h):
+        """x [B, 7168] BF16 -> h [B, H] BF16; ``hg`` [B, 2H] FP32 only shapes the grid (never written)."""
+        from ..common.host import stream as current_stream
+        from ..gemm import projection as PJ
+
+        code = self.kernels[x.shape[0]]
+        args = (self.weight_view, PJ.matrix_view(x), PJ.matrix_view(hg, output=True))
+        args += (PJ.matrix_view(h, output=True), cutlass_int64(self.maps[64].data_ptr()))
+        code(*args, *self.scalars, current_stream(self.device))
+        return h
+
+
+def cutlass_int64(value):
+    import cutlass
+
+    return cutlass.Int64(value)
