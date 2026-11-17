@@ -21,6 +21,16 @@ def enabled_tp_sizes() -> frozenset[int]:
     return frozenset({8, 16}) if os.environ.get("K31MK_TP16", "0") == "1" else frozenset({8})
 
 
+SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
+
+
+def resident_blocks() -> int:
+    """GB300's 152 SMs; with "sm148" listed in SGLANG_NVIDIA_MEGAKERNEL_SLOTS, the 148 of a
+    B200/GB200 (SM100) or a B300, the same opt-in as deepseek_v41 (sgl-project/sgl-nvidia-mega#35)."""
+    slots = {name.strip() for name in os.environ.get(SLOTS_ENV, "").split(",") if name.strip()}
+    return 148 if "sm148" in slots else 152
+
+
 def heads(tp: int) -> int:
     if tp not in (8, 16):
         raise ValueError(f"Kimi K3 megakernel shapes exist for TP8 and TP16, not TP{tp}")
